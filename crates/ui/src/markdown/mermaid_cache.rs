@@ -91,6 +91,11 @@ impl MermaidCache {
 
     /// Look up a fence painted in the current pass, queueing it if unseen.
     pub(crate) fn request(&mut self, code: &str, frame_id: &str) -> Lookup {
+        self.request_for_row(code, frame_row(frame_id))
+    }
+
+    /// [`Self::request`] for media that knows the row painting it.
+    pub(crate) fn request_for_row(&mut self, code: &str, row: &str) -> Lookup {
         let frame = self.frame;
         let entry = match self.entries.get_mut(code) {
             Some(entry) => entry,
@@ -104,7 +109,6 @@ impl MermaidCache {
             }
         };
         entry.used = frame;
-        let row = frame_row(frame_id);
         if !entry.rows.iter().any(|known| known == row) {
             entry.rows.push(row.to_owned().into());
         }

@@ -42,13 +42,21 @@ Manual validation on macOS and a second physical remote device must be recorded 
 
 ## Mermaid in chat
 
-Assistant replies render ```` ```mermaid ```` fences as diagrams, sharing the file preview's engine, fence frame, source toggle, Copy action and lightbox. Inline images in chat keep their existing text rendering.
+Assistant replies render ```` ```mermaid ```` fences as diagrams, sharing the file preview's engine, fence frame, source toggle, Copy action and lightbox. Inline images are drawn too; see [Images in chat](#images-in-chat).
 
 Streaming never renders a fence that may still be growing. Only blocks that a later row of the same reply follows, or blocks of a completed reply, request a diagram. The streaming tail keeps its source; per-token commits start no render work. Until a diagram is ready, the fence shows its ordinary source, so completion changes the row height at most once. A failed render keeps the source and shows the engine's diagnostic in a warning marker in the fence header.
 
 Rows request their fences while they lay out, so only painted diagrams cost anything. One serialized loop per transcript renders them off the UI thread, choosing its next source between renders and dropping requests whose rows scrolled away. Retained diagrams share a 64 MiB budget and are evicted least recently painted first, with a 64-entry cap; an evicted diagram renders again when its row returns. Diagrams painted in the latest two passes are never evicted. Theme changes discard every diagram, and results computed under the previous theme are rejected. Rasters follow the conversation column width and display density, under the same budget check before a larger re-raster.
 
 A diagram swap remeasures only the rows painting it and uses the same layout signals as other row-height changes. The bottom pin glides to the new end, and the own-turn runway reservation absorbs the change in the same layout without moving the sent prompt. Source toggles keep the stable row identity across streaming completion. The lightbox enlarges the diagram within the memory the retained diagrams leave available and releases that raster when it closes.
+
+## Images in chat
+
+Assistant replies draw Markdown images of local files inline, centered at their natural size up to 480px tall, and open them in the shared lightbox. A source resolves exactly like a file link: against the linking chat's own checkout, then its parent's and the device's project roots. Relative paths, absolute paths and `file://` URLs are accepted, including host files outside every checkout such as `/tmp/plot.png`. The file is read by the device that owns the chat through the workspace image RPC, so a remote chat's images load like its files. PNG, JPEG, GIF, WebP, BMP and SVG are drawn.
+
+Web images are never fetched. A reply can be steered by whatever the agent read, and loading a URL it names would disclose the reader's address and anything encoded in that URL. HTTP(S) and `data:` sources keep their existing text rendering, as does any image that fails to load or names a file the device cannot read.
+
+Images use the same lazy cache as diagrams, with the same streaming rule: a block requests its images only once a later row of the reply follows it or the reply completes, and shows its text until the image is ready, so completion changes the row height at most once. Reads are serialized per transcript with a 30-second deadline and the 8 MiB workspace image limit. Rasters keep one static frame downsampled to at most 2048 pixels on either axis; SVG is sanitized as in the file preview. Retained images have their own 64 MiB budget and 64-entry cap, evicted least recently painted first. A failed read is not retried until its entry is evicted, and a file rewritten at the same path keeps its first image while retained.
 
 ## Implementation validation
 
@@ -78,3 +86,7 @@ Chat Mermaid rendering was checked on Linux with `cargo test -p zeron-ui --lib -
 ### Diagram style follow-up
 
 The Zeron diagram style was checked with `cargo test -p zeron-ui --lib -- --test-threads=1` (1531 passed), Rustfmt for changed modules and Clippy, which reports no new warnings in changed code. New unit tests cover the transparent canvas, rounded node corners, accent-tinted default decisions alongside an explicitly styled one that keeps its colors, themed Gantt gridlines, and diagram type detection past front matter and comments. The six-fixture corpus was rendered with `ZERON_MERMAID_ARTIFACTS` in light, dark and Geist Mono variants. It was composited onto the fence body color at the chat column size and inspected visually. Native visual verification in the running application was not performed.
+
+### Images in chat follow-up
+
+Inline chat images were checked on Linux with `cargo test -p zeron-ui --lib -- --test-threads=1` (1549 passed) and `cargo check -p zeron`. Unit tests cover source resolution against the chat roots, outside files and `file://` URLs, and the rejection of web, `data:`, escaping and non-image sources. A transcript test verifies that a streaming tail starts no read, that a completed reply queues only its local images, that a loaded image replaces its text at its natural size while a failed one keeps it, and that the lightbox opens and closes. That test exposed the shared preview box taking its height from the column width instead of the image's; the box now has a definite width, which also applies to the file preview and chat diagrams. Native visual verification in the running application was not performed.

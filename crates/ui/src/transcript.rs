@@ -42,6 +42,7 @@ use gpui::{
 use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry, SubagentStatus};
 use zeron_proto::ToolCall;
 
+use crate::markdown::chat_images;
 use crate::markdown::mermaid_cache::{self, MermaidCache};
 use crate::markdown::parser::{
     Block, BlockTree, IncrementalParser, InlineRun, InlineStyle, parse_full,
@@ -76,6 +77,11 @@ fn jump_visibility(was_shown: bool, distance: f32) -> bool {
             SCROLL_BUTTON_THRESHOLD_PX
         }
 }
+/// The media cache discards entries when its style changes; images hold
+/// one constant style so a theme change keeps them.
+const IMAGE_STYLE: u32 = 0;
+/// One inline image read, relay round trips included.
+const IMAGE_READ_DEADLINE: Duration = Duration::from_secs(30);
 /// Bound session-local viewport memory independently of total chat history.
 const MAX_SAVED_VIEWPORTS: usize = 256;
 /// Bound locally-authored queue ids waiting to become transcript prompts.
@@ -3272,6 +3278,12 @@ pub struct Transcript {
     /// Prepared diagram shown in the lightbox: its natural size frames the
     /// enlarged raster, which is released when the lightbox closes.
     diagram_zoom: Option<crate::image_media::MediaImage>,
+    /// Images drawn inline in settled Markdown blocks: the same lazy cache
+    /// as `diagrams`, keyed by [`chat_images::ImageRead::key`] instead of a
+    /// fence's source.
+    images: Rc<RefCell<MermaidCache>>,
+    /// The single serialized image read loop, while requests remain.
+    image_worker: Option<Task<()>>,
     /// In-flight ReadAttachmentChunk loads, keyed by device, path and validation
     /// policy; results land in the global attachment cache.
     attachment_loads: HashMap<crate::attachments::AttachmentKey, Task<()>>,
@@ -3450,6 +3462,7 @@ impl Transcript {
         cx.on_release(|this: &mut Self, cx| {
             this.close_diagram_zoom(cx);
             crate::image_media::release_media(this.diagrams.borrow_mut().drain(), cx);
+            crate::image_media::release_media(this.images.borrow_mut().drain(), cx);
         })
         .detach();
         let text_changes = cx.subscribe(
@@ -3556,6 +3569,8 @@ impl Transcript {
             diagram_media: None,
             diagram_worker: None,
             diagram_zoom: None,
+            images: Rc::default(),
+            image_worker: None,
             attachment_loads: HashMap::new(),
             attachment_retries: HashMap::new(),
             blob_details: HashMap::new(),
@@ -5897,6 +5912,142 @@ impl Transcript {
         media.clone()
     }
 
+    /// `diagram_media` plus the row's inline images. A source resolves
+    /// against the linking chat's checkouts and draws once loaded; until
+    /// then, on failure, and for anything that is not a file the chat's
+    /// device can read, the image keeps its ordinary text.
+    fn row_media(
+        &mut self,
+        row_id: &SharedString,
+        link: Option<&render::LinkUi>,
+        cx: &Context<Self>,
+    ) -> render::MediaUi {
+        let mut media = self.diagram_media(cx);
+        let Some((chat, roots)) =
+            link.and_then(|link| link.source_session.clone().zip(link.file_roots.clone()))
+        else {
+            return media;
+        };
+        let cache = self.images.clone();
+        let owner = cx.weak_entity();
+        let row = row_id.clone();
+        media.image = Some(Rc::new(move |image, id, _theme| {
+            let read = chat_images::resolve(&image.source, &chat, &roots)?;
+            let mermaid_cache::Lookup::Ready(media) =
+                cache.borrow_mut().request_for_row(&read.key(), &row)
+            else {
+                return None;
+            };
+            let open = owner.clone();
+            let source = media.clone();
+            let name: SharedString = if image.alt.is_empty() {
+                read.path.rsplit('/').next().unwrap_or_default().to_owned()
+            } else {
+                image.alt.clone()
+            }
+            .into();
+            Some(crate::image_media::preview_element(
+                &media,
+                id,
+                move |window, cx| {
+                    let _ = open.update(cx, |this, cx| {
+                        let available = mermaid_cache::MAX_RETAINED_BYTES
+                            .saturating_sub(this.images.borrow().retained_bytes());
+                        this.open_media_preview(
+                            source.clone(),
+                            crate::attachments::PreviewImage::new(
+                                name.clone(),
+                                source.image.clone(),
+                            ),
+                            available,
+                            window,
+                            cx,
+                        )
+                    });
+                },
+            ))
+        }));
+        media
+    }
+
+    /// Read requested images one at a time through the owning chat's
+    /// workspace file context. Like the diagram loop, the next read is picked
+    /// between loads, so rows that scrolled away meanwhile are skipped.
+    fn ensure_image_worker(&mut self, cx: &mut Context<Self>) {
+        if self.image_worker.is_some() || !self.images.borrow_mut().take_new_requests() {
+            return;
+        }
+        self.image_worker = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let job = this.update(cx, |this, cx| {
+                    let key = this.images.borrow_mut().next_job();
+                    if key.is_none() {
+                        this.image_worker = None;
+                    }
+                    key.map(|key| {
+                        let load = chat_images::ImageRead::from_key(&key).and_then(|read| {
+                            let state = this.state.read(cx);
+                            let context = crate::files::client::FilesRequestContext::for_chat(
+                                state, &read.chat,
+                            )?;
+                            let client = crate::files::client::WorkspaceFilesClient::new(
+                                state.engine().cloned()?,
+                                context,
+                            );
+                            Some((client, read.path))
+                        });
+                        (key, load)
+                    })
+                });
+                let Ok(Some((key, load))) = job else {
+                    return;
+                };
+                let result = match load {
+                    Some((client, path)) => {
+                        let executor = cx.background_executor().clone();
+                        let read = Box::pin(async {
+                            let (mime, bytes) = client
+                                .read_context_image(path)
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            executor
+                                .spawn(async move {
+                                    crate::image_media::decode_chat_image(&mime, bytes)
+                                })
+                                .await
+                        });
+                        let deadline = Box::pin(executor.timer(IMAGE_READ_DEADLINE));
+                        match futures::future::select(read, deadline).await {
+                            futures::future::Either::Left((result, _)) => result,
+                            futures::future::Either::Right(_) => Err("Image read timed out".into()),
+                        }
+                    }
+                    None => Err("Workspace image connection unavailable".into()),
+                };
+                if this
+                    .update(cx, |this, cx| this.finish_image(key, result, cx))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }));
+    }
+
+    fn finish_image(
+        &mut self,
+        key: String,
+        result: Result<crate::image_media::MediaImage, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((rows, released)) = self.images.borrow_mut().finish(key, IMAGE_STYLE, result)
+        else {
+            return;
+        };
+        crate::image_media::release_media(released, cx);
+        self.diagram_layout_changed(&rows, cx);
+    }
+
     /// Render requested diagrams one at a time off the UI thread. The loop
     /// picks its next source between renders, so rows that scrolled away in
     /// the meantime are skipped rather than queued.
@@ -5954,7 +6105,7 @@ impl Transcript {
         self.diagram_layout_changed(&rows, cx);
     }
 
-    /// A diagram replaced its source (or the reverse): remeasure the rows
+    /// A diagram or image replaced its source (or the reverse): remeasure the rows
     /// painting it and let the bottom pin and the own-turn runway absorb the
     /// height change, exactly like any other layout-affecting row update.
     fn diagram_layout_changed(&mut self, rows: &[SharedString], cx: &mut Context<Self>) {
@@ -5986,10 +6137,26 @@ impl Transcript {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.close_diagram_zoom(cx);
-        let viewport = window.viewport_size();
         let available = mermaid_cache::MAX_RETAINED_BYTES
             .saturating_sub(self.diagrams.borrow().retained_bytes());
+        let preview =
+            crate::attachments::PreviewImage::new("Mermaid diagram", source.image.clone())
+                .with_plate(crate::markdown::mermaid::Palette::plate(Theme::of(cx)));
+        self.open_media_preview(source, preview, available, window, cx);
+    }
+
+    /// Open prepared media in the shared lightbox. A vector source is
+    /// rasterized for the window within `available`; a raster shows as is.
+    fn open_media_preview(
+        &mut self,
+        source: crate::image_media::MediaImage,
+        mut preview: crate::attachments::PreviewImage,
+        available: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_diagram_zoom(cx);
+        let viewport = window.viewport_size();
         let enlarged = source.enlarged(
             (
                 f32::from(viewport.width) * 0.9,
@@ -6000,17 +6167,15 @@ impl Transcript {
             None,
         );
         self.attachment_preview_return_focus = window.focused(cx);
-        self.attachment_preview = Some(
-            crate::attachments::PreviewImage::new("Mermaid diagram", enlarged.image)
-                .with_plate(crate::markdown::mermaid::Palette::plate(Theme::of(cx))),
-        );
+        preview.image = enlarged.image;
+        self.attachment_preview = Some(preview);
         self.diagram_zoom = Some(source);
         window.focus(&self.attachment_preview_focus, cx);
         cx.notify();
     }
 
-    /// Release a diagram lightbox's dedicated raster. The row's own preview
-    /// stays with the diagram cache.
+    /// Release a media lightbox's dedicated raster. The row's own preview
+    /// stays with its cache.
     fn close_diagram_zoom(&mut self, cx: &mut gpui::App) {
         let Some(source) = self.diagram_zoom.take() else {
             return;
@@ -6694,7 +6859,7 @@ impl Transcript {
                 let code = self.code_uis_for(&row.id, &top.block, *block_ix, cx);
                 let opts = RenderOptions {
                     tasks: None,
-                    media: Some(self.diagram_media(cx)),
+                    media: Some(self.row_media(&row.id, link.as_ref(), cx)),
                     row_key: row.id.clone(),
                     veil: None,
                     cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
@@ -6754,17 +6919,17 @@ impl Transcript {
                         .clone()
                 });
                 // A streaming fence may still be growing, so only blocks the
-                // reply has already moved past draw diagrams: a later row of
-                // the same entry proves this block is complete. The tail
-                // keeps its source until the next block or completion, and
-                // per-token commits never start a render.
+                // reply has already moved past draw diagrams and images: a
+                // later row of the same entry proves this block is complete.
+                // The tail keeps its source until the next block or
+                // completion, and per-token commits never start a render.
                 let settled = self
                     .rows
                     .get(ix + 1)
                     .is_some_and(|next| next.entry_id == row.entry_id);
                 let opts = RenderOptions {
                     tasks: None,
-                    media: settled.then(|| self.diagram_media(cx)),
+                    media: settled.then(|| self.row_media(&row.id, link.as_ref(), cx)),
                     row_key: row.id.clone(),
                     veil: veil.clone(),
                     cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
@@ -6853,8 +7018,10 @@ impl Transcript {
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
             RowKind::ForkMarker { source_title, .. } => fork_marker(source_title.clone(), &theme),
         };
-        // Diagram fences this row just requested start rendering after layout.
+        // Diagram fences and images this row just requested start loading
+        // after layout.
         self.ensure_diagram_worker(cx);
+        self.ensure_image_worker(cx);
 
         // Hover-revealed metadata strip: a RESERVED 32px lane under the
         // entry's last row. Timestamp, copy action, and copied feedback only
@@ -9124,7 +9291,11 @@ impl Render for Transcript {
             } else {
                 self.content_width
             };
-            released.extend(diagrams.set_view((column.max(1.0), 480.0), window.scale_factor()));
+            let view = (column.max(1.0), 480.0);
+            released.extend(diagrams.set_view(view, window.scale_factor()));
+            let mut images = self.images.borrow_mut();
+            released.extend(images.begin_frame(IMAGE_STYLE));
+            released.extend(images.set_view(view, window.scale_factor()));
             released
         };
         if !released_diagrams.is_empty() {
@@ -13575,6 +13746,108 @@ mod tests {
                     assert!(this.diagram_zoom.is_none());
                 });
                 draw(window, cx);
+            });
+        }
+
+        #[test]
+        fn inline_images_keep_their_text_until_loaded_and_never_fetch_the_web() {
+            with_window(|transcript, window, cx| {
+                const TEXT: &str = "Before.\n\n![shot](/tmp/shot.png)\n\n![gone](/tmp/gone.png)\n\n![web](https://example.com/a.png)";
+                let reply = |status, text: &str| {
+                    vec![
+                        prompt("prompt"),
+                        assistant("reply", status, vec![text_part("text", text)]),
+                    ]
+                };
+                let row_height = |id: &str, cx: &gpui::App| {
+                    let this = transcript.read(cx);
+                    let ix = this.rows.iter().position(|row| row.id.as_ref() == id);
+                    this.list.bounds_for_item(ix.unwrap()).unwrap().size.height
+                };
+                // The image is the streaming tail: it may still be growing.
+                transcript.update(cx, |this, cx| {
+                    this.rail_enabled = false;
+                    this.pinned = false;
+                    this.set_workspace_link_handler(render::LinkUi {
+                        source_session: None,
+                        source_local: true,
+                        file_roots: None,
+                        handler: Rc::new(|_, _, _| render::LinkOutcome::Rejected),
+                    });
+                    let tail = &TEXT[..TEXT.find("\n\n![gone]").unwrap()];
+                    feed(this, reply(MessageStatus::Streaming, tail), cx)
+                });
+                draw(window, cx);
+                assert!(transcript.read(cx).image_worker.is_none());
+
+                // Enough reply after the images that the viewport can anchor
+                // on them: a pinned end is glued, where rows report no bounds.
+                let text = format!("{TEXT}\n\nAfter. {}", "More detail. ".repeat(300));
+                transcript.update(cx, |this, cx| {
+                    feed(this, reply(MessageStatus::Complete, &text), cx);
+                    this.pinned = false;
+                    let ix = this
+                        .rows
+                        .iter()
+                        .position(|row| row.id.as_ref() == "reply#text.1");
+                    this.list.scroll_to(ListOffset {
+                        item_ix: ix.unwrap(),
+                        offset_in_item: px(0.0),
+                    });
+                    cx.notify();
+                });
+                draw(window, cx);
+                assert!(transcript.read(cx).image_worker.is_some());
+                let text_height = row_height("reply#text.1", cx);
+                let gone_height = row_height("reply#text.2", cx);
+
+                // Finish the queued reads as the worker would: one loads,
+                // one fails. The web image was never queued.
+                let mut png = std::io::Cursor::new(Vec::new());
+                image::RgbaImage::new(320, 200)
+                    .write_to(&mut png, image::ImageFormat::Png)
+                    .unwrap();
+                let media =
+                    crate::image_media::decode_chat_image("image/png", png.into_inner()).unwrap();
+                let mut keys = Vec::new();
+                transcript.update(cx, |this, cx| {
+                    loop {
+                        let next = this.images.borrow_mut().next_job();
+                        let Some(key) = next else { break };
+                        let result = if key.ends_with("shot.png") {
+                            Ok(media.clone())
+                        } else {
+                            Err("file not found".into())
+                        };
+                        this.finish_image(key.clone(), result, cx);
+                        keys.push(key);
+                    }
+                });
+                keys.sort();
+                assert_eq!(keys, ["chat\n/tmp/gone.png", "chat\n/tmp/shot.png"]);
+                draw(window, cx);
+                // The row holds the image at its natural 320x200, not a box
+                // sized from the column width.
+                let image_height = row_height("reply#text.1", cx);
+                assert!(image_height > text_height + px(150.0), "{image_height:?}");
+                assert!(image_height < px(260.0), "{image_height:?}");
+                assert_eq!(row_height("reply#text.2", cx), gone_height);
+
+                // The lightbox shows the same bounded raster and closes clean.
+                cx.update_window(window.into(), |_, window, cx| {
+                    transcript.update(cx, |this, cx| {
+                        let preview =
+                            crate::attachments::PreviewImage::new("shot", media.image.clone());
+                        this.open_media_preview(media.clone(), preview, 0, window, cx)
+                    });
+                })
+                .unwrap();
+                draw(window, cx);
+                transcript.update(cx, |this, cx| {
+                    assert!(this.attachment_preview.is_some());
+                    this.close_diagram_zoom(cx);
+                    assert!(this.attachment_preview.is_none());
+                });
             });
         }
 

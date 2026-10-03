@@ -142,12 +142,15 @@ pub(crate) fn preview_element(
     on_click: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
 ) -> gpui::AnyElement {
     use gpui::{InteractiveElement as _, IntoElement as _, StyledImage as _, prelude::*};
+    // The height follows the width through the aspect ratio, so the width
+    // must be the drawn one: a full-width box capped by `max_w` would take
+    // its height from the column instead.
+    let scale = (480.0 / loaded.height).min(1.0);
     gpui::div()
         .id(id)
-        .w_full()
-        .max_w(gpui::px(loaded.width))
+        .w(gpui::px(loaded.width * scale))
+        .max_w_full()
         .mx_auto()
-        .max_h(gpui::px(480.0))
         .aspect_ratio(loaded.width / loaded.height)
         .cursor_pointer()
         .role(gpui::Role::Button)
@@ -226,6 +229,17 @@ pub(crate) fn decode_project_icon(mime: &str, bytes: Vec<u8>) -> Result<MediaIma
         decode_image(mime, bytes).map(|media| media.for_view((16.0, 16.0), 2.0, 4096))
     } else {
         decode_raster_image_bounded(bytes, zeron_proto::MAX_WORKSPACE_IMAGE_BYTES, Some(64))
+    }
+}
+
+/// Images a chat reply draws inline: a raster keeps one static frame
+/// downsampled to at most 2048 pixels on either axis, so no single entry
+/// can exceed the transcript's media budget.
+pub(crate) fn decode_chat_image(mime: &str, bytes: Vec<u8>) -> Result<MediaImage, String> {
+    if mime == "image/svg+xml" {
+        decode_image(mime, bytes)
+    } else {
+        decode_raster_image_bounded(bytes, zeron_proto::MAX_WORKSPACE_IMAGE_BYTES, Some(2048))
     }
 }
 

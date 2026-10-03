@@ -110,8 +110,11 @@ pub struct TaskUi {
 #[derive(Clone)]
 pub struct MediaUi {
     pub diagram: Option<Rc<dyn Fn(&str, SharedString, &Theme) -> DiagramView>>,
-    /// `None` keeps inline images in their ordinary text rendering.
-    pub image: Option<Rc<dyn Fn(&super::parser::InlineImage, SharedString, &Theme) -> AnyElement>>,
+    /// `None` keeps inline images in their ordinary text rendering, and so
+    /// does a handler that returns `None` for one image (not loaded yet, or
+    /// not an image this surface draws).
+    pub image:
+        Option<Rc<dyn Fn(&super::parser::InlineImage, SharedString, &Theme) -> Option<AnyElement>>>,
 }
 
 /// How a Mermaid fence presents itself on the owning surface.
@@ -1821,48 +1824,48 @@ fn text_element(
 ) -> AnyElement {
     if let Some(image_ui) = opts.media.as_ref().and_then(|media| media.image.as_ref()) {
         if runs.iter().any(|run| run.style.image.is_some()) {
-            let mut elements = Vec::new();
-            let mut start = 0;
-            for (index, run) in runs.iter().enumerate() {
-                if let Some(image) = &run.style.image {
-                    if start < index {
-                        elements.push(text_element(
-                            &runs[start..index],
-                            size,
-                            line_height,
-                            bold_default,
-                            top_ix,
-                            ix.wrapping_mul(4099).wrapping_add(start + 1000),
-                            opts,
-                            theme,
-                        ));
-                    }
-                    elements.push(image_ui(
-                        image,
-                        format!("{}-image-{ix}-{index}", opts.row_key).into(),
+            // An image the handler declines stays in the text around it; a
+            // paragraph with none drawn falls through to its ordinary layout.
+            let drawn: Vec<_> = runs
+                .iter()
+                .enumerate()
+                .filter_map(|(index, run)| {
+                    let id = format!("{}-image-{ix}-{index}", opts.row_key).into();
+                    Some((index, image_ui(run.style.image.as_ref()?, id, theme)?))
+                })
+                .collect();
+            if !drawn.is_empty() {
+                let text = |range: std::ops::Range<usize>| {
+                    text_element(
+                        &runs[range.clone()],
+                        size,
+                        line_height,
+                        bold_default,
+                        top_ix,
+                        ix.wrapping_mul(4099).wrapping_add(range.start + 1000),
+                        opts,
                         theme,
-                    ));
+                    )
+                };
+                let mut elements = Vec::new();
+                let mut start = 0;
+                for (index, element) in drawn {
+                    if start < index {
+                        elements.push(text(start..index));
+                    }
+                    elements.push(element);
                     start = index + 1;
                 }
+                if start < runs.len() {
+                    elements.push(text(start..runs.len()));
+                }
+                return div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .children(elements)
+                    .into_any_element();
             }
-            if start < runs.len() {
-                elements.push(text_element(
-                    &runs[start..],
-                    size,
-                    line_height,
-                    bold_default,
-                    top_ix,
-                    ix.wrapping_mul(4099).wrapping_add(start + 1000),
-                    opts,
-                    theme,
-                ));
-            }
-            return div()
-                .flex()
-                .flex_col()
-                .gap(px(8.0))
-                .children(elements)
-                .into_any_element();
         }
     }
     if let Some(lines) = opts
