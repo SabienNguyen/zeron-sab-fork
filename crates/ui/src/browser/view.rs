@@ -93,6 +93,19 @@ impl BrowserSurface {
                     self.validation = None;
                     window.focus(&self.focus, cx);
                 }
+                // "PaletteSearch" leaves bare arrows unbound for a palette's
+                // list navigation. The address bar has no list, so move the
+                // caret; up and down reach the ends of its single line.
+                "left" | "right" | "up" | "down" if !mods.shift => {
+                    use crate::composer::{End, Home, Left, Right};
+                    let action: Box<dyn gpui::Action> = match key {
+                        "left" => Box::new(Left),
+                        "right" => Box::new(Right),
+                        "up" => Box::new(Home),
+                        _ => Box::new(End),
+                    };
+                    window.dispatch_action(action, cx);
+                }
                 _ => return,
             }
         } else {

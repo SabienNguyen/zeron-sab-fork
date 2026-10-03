@@ -399,6 +399,18 @@ pub use pi::PiHarness;
 
 /// Reap the child: Unix sends SIGTERM then SIGKILL after `kill_grace`;
 /// Windows terminates the owned job after protocol shutdown has finished.
+/// Retire a discovery probe whose answer is already in hand. A CLI can take
+/// most of a second to honor SIGTERM, and the picker waiting on this reply
+/// has no use for the exit status, so Unix reaps the child off the reply path.
+/// Windows terminates the job at once and keeps the executable locked until
+/// then, so it still waits.
+pub(crate) async fn retire_probe(mut child: process::Child, kill_grace: std::time::Duration) {
+    #[cfg(windows)]
+    shutdown_child(&mut child, kill_grace).await;
+    #[cfg(not(windows))]
+    tokio::spawn(async move { shutdown_child(&mut child, kill_grace).await });
+}
+
 pub(crate) async fn shutdown_child(child: &mut process::Child, kill_grace: std::time::Duration) {
     #[cfg(windows)]
     {

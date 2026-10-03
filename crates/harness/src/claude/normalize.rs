@@ -143,6 +143,10 @@ pub(crate) fn decode_tool_use(name: &str, input: &Value) -> ToolCall {
     }
 }
 
+/// The `model` on assistant frames the CLI writes itself rather than relays
+/// from the API (local slash-command output, turn-failure notices).
+const SYNTHETIC_MODEL: &str = "<synthetic>";
+
 fn new_message_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -513,7 +517,22 @@ impl Normalizer {
                         self.agent_spawn_tools.insert(b.id.clone());
                     }
                 }
-                let mut out: Vec<AgentEvent> = f
+                // A local slash command (`/output-style`, `/context`, …) never
+                // reaches the model: its reply is one whole `<synthetic>`
+                // assistant frame with no partial deltas (live-verified,
+                // 2.1.288), so these text blocks are the only copy. A failed
+                // turn is synthetic too, but `error` below already words it.
+                let synthetic = f.message.model.as_deref() == Some(SYNTHETIC_MODEL);
+                let mut out: Vec<AgentEvent> = Vec::new();
+                if synthetic && f.error.is_none() {
+                    out.extend(
+                        f.message
+                            .blocks()
+                            .filter(|b: &ContentBlock| b.kind == "text" && !b.text.is_empty())
+                            .map(|b| AgentEvent::TextDelta { text: b.text }),
+                    );
+                }
+                let calls: Vec<AgentEvent> = f
                     .message
                     .blocks()
                     .filter(|b: &ContentBlock| b.kind == "tool_use")
@@ -566,8 +585,13 @@ impl Normalizer {
                         std::iter::once(call).chain(opening).chain(steer)
                     })
                     .collect();
-                self.last_model = f.message.model.clone().or(self.last_model.take());
-                if let Some(usage) = &f.message.usage {
+                out.extend(calls);
+                // The placeholder model and its all-zero usage are not the
+                // conversation's: keep them out of the context meter.
+                if !synthetic {
+                    self.last_model = f.message.model.clone().or(self.last_model.take());
+                }
+                if let Some(usage) = f.message.usage.as_ref().filter(|_| !synthetic) {
                     let fields = [
                         "input_tokens",
                         "cache_read_input_tokens",
@@ -840,6 +864,47 @@ mod tests {
             decode_tool_use("Mystery", &json!({})),
             ToolCall::Unknown { .. }
         ));
+    }
+
+    #[test]
+    fn local_command_output_surfaces_from_the_synthetic_frame() {
+        // `/output-style` et al. answer with one non-streamed frame (live
+        // 2.1.288); its zero usage must not reset the context meter.
+        let mut norm = Normalizer::new();
+        let primary = crate::claude::wire::parse_frame(
+            r#"{"type":"assistant","message":{"model":"primary","content":[],"usage":{"input_tokens":200}}}"#,
+        )
+        .expect("parses");
+        norm.normalize(primary, false);
+        let reply = crate::claude::wire::parse_frame(
+            r#"{"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"Output style: default"}],"usage":{"input_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+        )
+        .expect("parses");
+        let ev = norm.normalize(reply, false);
+        assert_eq!(ev.len(), 2, "text + completion: {ev:?}");
+        assert_eq!(
+            ev[0],
+            AgentEvent::TextDelta {
+                text: "Output style: default".into()
+            }
+        );
+        assert!(matches!(
+            ev[1],
+            AgentEvent::AssistantMessageCompleted { .. }
+        ));
+        assert_eq!(norm.last_model.as_deref(), Some("primary"));
+    }
+
+    #[test]
+    fn synthetic_failure_notices_stay_a_single_error() {
+        let ev = normalize_one(
+            r#"{"type":"assistant","error":"rate_limit","message":{"model":"<synthetic>","content":[{"type":"text","text":"API Error: Rate limit reached"}]}}"#,
+        );
+        assert!(
+            !ev.iter().any(|e| matches!(e, AgentEvent::TextDelta { .. })),
+            "{ev:?}"
+        );
+        assert!(ev.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
     }
 
     fn normalize_one(raw: &str) -> Vec<AgentEvent> {

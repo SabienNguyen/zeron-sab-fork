@@ -766,6 +766,42 @@ mod tests {
     }
 
     #[gpui::test]
+    fn address_arrows_move_the_caret(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            crate::composer::init(cx, Default::default());
+            cx.set_global(crate::theme::Theme::default());
+            bind_keys(cx, &crate::settings::KeymapConfig::default());
+        });
+        let window = cx.add_window(|window, cx| {
+            BrowserSurface::new(BrowserContext::default(), false, window, cx)
+        });
+        window
+            .update(cx, |browser, window, cx| {
+                browser
+                    .address
+                    .update(cx, |input, cx| input.set_text("localhost:3000", cx));
+                window.focus(&browser.address.focus_handle(cx), cx);
+            })
+            .unwrap();
+        for (keys, expected) in [
+            ("up", 0),
+            ("right right", 2),
+            ("left", 1),
+            ("down", "localhost:3000".len()),
+        ] {
+            cx.simulate_keystrokes(window.into(), keys);
+            window
+                .update(cx, |browser, window, cx| {
+                    assert_eq!(browser.address.read(cx).cursor_offset(), expected, "{keys}");
+                    assert!(browser.address.focus_handle(cx).is_focused(window));
+                })
+                .unwrap();
+        }
+        window.update(cx, |_, window, _| window.blur()).unwrap();
+    }
+
+    #[gpui::test]
     fn customized_app_shortcuts_win_over_browser_defaults(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
             let mut config = crate::settings::KeymapConfig::default();
