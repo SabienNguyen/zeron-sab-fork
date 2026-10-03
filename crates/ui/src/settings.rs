@@ -862,6 +862,9 @@ pub struct UiSettings {
     pub sound_input_enabled: bool,
     /// Chime when a run fails or the durable connection state degrades.
     pub sound_attention_enabled: bool,
+    /// User-chosen audio files replacing the embedded session chimes.
+    #[serde(skip_serializing_if = "crate::sound::CustomSounds::is_empty")]
+    pub custom_sounds: crate::sound::CustomSounds,
     /// Desktop banner notifications on the same transitions.
     /// `ZERON_DISABLE_NOTIFICATIONS` overrides.
     pub notifications_enabled: bool,
@@ -1001,6 +1004,7 @@ impl Default for UiSettings {
             sound_completion_enabled: true,
             sound_input_enabled: true,
             sound_attention_enabled: true,
+            custom_sounds: crate::sound::CustomSounds::default(),
             notifications_enabled: true,
             notifications_background_only: true,
             files_panel_width: FILES_PANEL_DEFAULT,
@@ -1644,6 +1648,7 @@ impl UiSettings {
             sound_completion_enabled,
             sound_input_enabled,
             sound_attention_enabled,
+            custom_sounds,
             notifications_enabled,
             notifications_background_only,
             files_panel_width,
@@ -2657,6 +2662,10 @@ mod tests {
             sound_completion_enabled: false,
             sound_input_enabled: true,
             sound_attention_enabled: false,
+            custom_sounds: crate::sound::CustomSounds {
+                completion: Some("/tmp/done.ogg".into()),
+                ..Default::default()
+            },
             notifications_enabled: false,
             notifications_background_only: false,
             files_panel_width: 310.0,

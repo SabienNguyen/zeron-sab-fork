@@ -1,5 +1,7 @@
 //! Settings → Notifications: independently configurable session chimes plus
 //! desktop banners on the same status transitions (`shell::on_state_changed`).
+//! Each chime can be swapped for a user-chosen audio file and auditioned
+//! with its banner from the row.
 //!
 //! The ShortcutsPage arrangement: the page holds a working copy, every flip
 //! emits [`NotificationsEvent::Changed`], and the shell persists it. Nothing
@@ -10,6 +12,7 @@ use gpui::{Context, EventEmitter, SharedString, Window, div, prelude::*, px};
 use crate::icons;
 use crate::popover;
 use crate::settings::widgets;
+use crate::sound::{CustomSounds, Sound};
 use crate::theme::Theme;
 
 #[derive(Debug, Clone)]
@@ -20,6 +23,7 @@ pub enum NotificationsEvent {
         completion_sound: bool,
         input_sound: bool,
         attention_sound: bool,
+        custom_sounds: CustomSounds,
         desktop: bool,
         background_only: bool,
         agent_updates: bool,
@@ -32,6 +36,9 @@ pub struct NotificationsPage {
     completion_sound: bool,
     input_sound: bool,
     attention_sound: bool,
+    custom_sounds: CustomSounds,
+    /// Why the last chosen or tested sound file was rejected.
+    sound_error: Option<SharedString>,
     desktop: bool,
     background_only: bool,
     agent_updates: bool,
@@ -52,6 +59,44 @@ enum NotificationPreference {
 
 fn is_switch_activation(key: &str, is_held: bool) -> bool {
     !is_held && matches!(key, "enter" | "space")
+}
+
+/// Stable element-id fragment for a chime's row controls.
+fn sound_key(sound: Sound) -> &'static str {
+    match sound {
+        Sound::Done => "completion",
+        Sound::Request => "input",
+        Sound::Attention => "attention",
+    }
+}
+
+fn sound_label(sound: Sound) -> &'static str {
+    match sound {
+        Sound::Done => "Task completed",
+        Sound::Request => "Input required",
+        Sound::Attention => "Errors and disconnections",
+    }
+}
+
+/// The row's meta line: the custom file's name, or the embedded default.
+fn sound_file_label(custom: Option<&std::path::Path>) -> SharedString {
+    match custom {
+        Some(path) => path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string())
+            .into(),
+        None => "Default chime".into(),
+    }
+}
+
+fn unsupported_sound_message() -> SharedString {
+    let extensions = crate::sound::CUSTOM_SOUND_EXTENSIONS
+        .iter()
+        .map(|ext| ext.to_ascii_uppercase())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("That file can't be used as a sound. Choose one of: {extensions}.").into()
 }
 
 fn interactive_switch(
@@ -81,6 +126,7 @@ impl NotificationsPage {
         completion_sound: bool,
         input_sound: bool,
         attention_sound: bool,
+        custom_sounds: CustomSounds,
         desktop: bool,
         background_only: bool,
         agent_updates: bool,
@@ -92,6 +138,8 @@ impl NotificationsPage {
             completion_sound,
             input_sound,
             attention_sound,
+            custom_sounds,
+            sound_error: None,
             desktop,
             background_only,
             agent_updates,
@@ -104,6 +152,7 @@ impl NotificationsPage {
             completion_sound: self.completion_sound,
             input_sound: self.input_sound,
             attention_sound: self.attention_sound,
+            custom_sounds: self.custom_sounds.clone(),
             desktop: self.desktop,
             background_only: self.background_only,
             agent_updates: self.agent_updates,
@@ -123,6 +172,113 @@ impl NotificationsPage {
         *value = !*value;
         self.emit(cx);
         cx.notify();
+    }
+
+    fn set_custom_sound(
+        &mut self,
+        sound: Sound,
+        path: Option<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        if path
+            .as_deref()
+            .is_some_and(|path| !crate::sound::is_supported_custom_sound(path))
+        {
+            self.sound_error = Some(unsupported_sound_message());
+        } else {
+            self.sound_error = None;
+            self.custom_sounds.set(sound, path);
+            self.emit(cx);
+        }
+        cx.notify();
+    }
+
+    fn choose_sound(&mut self, sound: Sound, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose Sound".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let path = match receiver.await {
+                Ok(Ok(Some(mut paths))) => paths.pop(),
+                _ => None,
+            };
+            let Some(path) = path else {
+                return;
+            };
+            let _ = this.update(cx, |page, cx| page.set_custom_sound(sound, Some(path), cx));
+        })
+        .detach();
+    }
+
+    /// Audition one event exactly as a session would deliver it: its chime,
+    /// plus its banner when banners are on. Deliberate, so neither the
+    /// per-event mute nor the background-only rule applies.
+    fn test_sound(&mut self, sound: Sound, cx: &mut Context<Self>) {
+        let custom = self.custom_sounds.get(sound);
+        self.sound_error = custom.filter(|path| !path.is_file()).map(|path| {
+            format!(
+                "{} can't be found. Playing the default chime instead.",
+                path.display()
+            )
+            .into()
+        });
+        crate::sound::play(sound, custom);
+        if self.desktop {
+            crate::notify::post("Test notification", sound.banner_body(), None);
+        }
+        cx.notify();
+    }
+
+    /// Test / Choose / Reset for one chime's row; inert while the master
+    /// switch is off, like the row's own toggle.
+    fn sound_actions(&self, sound: Sound, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+        let accent = theme.accent;
+        let interactive = self.sound;
+        let key = sound_key(sound);
+        let label = sound_label(sound);
+        let button = |action: &'static str, tone: widgets::ActionTone| {
+            widgets::text_action(theme, tone, action)
+                .id(SharedString::from(format!(
+                    "notifications-{key}-sound-{}",
+                    action.to_ascii_lowercase()
+                )))
+                .role(gpui::Role::Button)
+                .aria_label(SharedString::from(format!("{action} {label} sound")))
+                .when(interactive, |el| {
+                    el.tab_index(0)
+                        .focus_visible(move |s| s.border_2().border_color(accent))
+                })
+        };
+        div()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .child(
+                button("Test", widgets::ActionTone::Quiet).when(interactive, |el| {
+                    el.on_click(cx.listener(move |this, _, _, cx| this.test_sound(sound, cx)))
+                }),
+            )
+            .child(
+                button("Choose", widgets::ActionTone::Outlined).when(interactive, |el| {
+                    el.on_click(cx.listener(move |this, _, _, cx| this.choose_sound(sound, cx)))
+                }),
+            )
+            .when(self.custom_sounds.get(sound).is_some(), |el| {
+                el.child(
+                    button("Reset", widgets::ActionTone::Quiet).when(interactive, |el| {
+                        el.on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.set_custom_sound(sound, None, cx)
+                            }),
+                        )
+                    }),
+                )
+            })
     }
 
     fn on_scroll_hovered(&mut self, hovered: &bool, _: &mut Window, cx: &mut Context<Self>) {
@@ -177,6 +333,10 @@ impl Render for NotificationsPage {
                 })
                 .child(widgets::toggle_switch(&theme, enabled, id))
         };
+        let sound_file_line = |sound: Sound| {
+            let name = sound_file_label(self.custom_sounds.get(sound));
+            widgets::meta_line(&theme, vec![div().child(name).into_any_element()])
+        };
         let card = widgets::section_card(&theme)
             .mt_0()
             .child(
@@ -205,8 +365,10 @@ impl Render for NotificationsPage {
                             .min_w(px(160.0))
                             .flex()
                             .flex_col()
-                            .child(widgets::row_title(&theme, "Task completed")),
+                            .child(widgets::row_title(&theme, "Task completed"))
+                            .child(sound_file_line(Sound::Done)),
                     )
+                    .child(self.sound_actions(Sound::Done, &theme, cx))
                     .child(
                         toggle(
                             "notifications-completion-sound-toggle",
@@ -233,8 +395,10 @@ impl Render for NotificationsPage {
                             .min_w(px(160.0))
                             .flex()
                             .flex_col()
-                            .child(widgets::row_title(&theme, "Input required")),
+                            .child(widgets::row_title(&theme, "Input required"))
+                            .child(sound_file_line(Sound::Request)),
                     )
+                    .child(self.sound_actions(Sound::Request, &theme, cx))
                     .child(
                         toggle(
                             "notifications-input-sound-toggle",
@@ -256,8 +420,10 @@ impl Render for NotificationsPage {
                             .min_w(px(160.0))
                             .flex()
                             .flex_col()
-                            .child(widgets::row_title(&theme, "Errors and disconnections")),
+                            .child(widgets::row_title(&theme, "Errors and disconnections"))
+                            .child(sound_file_line(Sound::Attention)),
                     )
+                    .child(self.sound_actions(Sound::Attention, &theme, cx))
                     .child(
                         toggle(
                             "notifications-attention-sound-toggle",
@@ -386,7 +552,12 @@ impl Render for NotificationsPage {
                                 .child(
                                     widgets::section(&theme, "Desktop", desktop_card).mt(px(24.0)),
                                 )
-                                .child(widgets::section(&theme, "Sounds", card)),
+                                .child(widgets::section(&theme, "Sounds", card))
+                                .children(
+                                    self.sound_error
+                                        .clone()
+                                        .map(|error| widgets::error_strip(&theme, error)),
+                                ),
                         ),
                 )
                 .fade_overflow_y(&self.scroll.scroll),
@@ -398,6 +569,15 @@ impl Render for NotificationsPage {
 #[cfg(test)]
 mod tests {
     use super::is_switch_activation;
+
+    #[test]
+    fn sound_rows_name_the_custom_file_or_the_default() {
+        assert_eq!(super::sound_file_label(None).as_ref(), "Default chime");
+        assert_eq!(
+            super::sound_file_label(Some(std::path::Path::new("/tmp/sounds/ding.wav"))).as_ref(),
+            "ding.wav"
+        );
+    }
 
     #[test]
     fn switches_accept_enter_or_space_once_per_press() {

@@ -1,4 +1,5 @@
-//! WebKitGTK renders offscreen in an isolated helper process. GPUI composites
+//! WebKit renders offscreen in an isolated helper process, built on WPE WebKit
+//! where it is available and WebKitGTK otherwise. GPUI composites
 //! its frames, so browser content uses the same clipping and blur as other UI.
 use super::model::{PageState, Presentation};
 use gpui::{Bounds, Pixels, RenderImage};
@@ -82,6 +83,37 @@ fn helper_path() -> Result<std::path::PathBuf, String> {
         .map_err(|e| e.to_string())?;
     Ok(path)
 }
+/// The engine the embedded helper was built against.
+const ENGINE: &str = env!("ZERON_BROWSER_ENGINE");
+
+/// The dynamic loader prefixes its complaint with the helper's cache path.
+fn stopped_message(reason: &str) -> String {
+    let reason = reason
+        .split_once(": error while loading shared libraries: ")
+        .map_or(reason, |(_, library)| library);
+    if reason.is_empty() {
+        format!(
+            "The browser helper stopped. Check that {ENGINE} is installed, then reopen the tab."
+        )
+    } else {
+        format!(
+            "The browser helper stopped: {reason}. Check that {ENGINE} and the libraries it needs are installed, then reopen the tab."
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn stopped_message_names_the_reason_the_helper_gave() {
+        assert!(stopped_message("").starts_with("The browser helper stopped. "));
+        assert!(stopped_message(
+            "/home/a/.cache/zeron/browser/webkit-1f: error while loading shared libraries: libjxl.so.0.12: cannot open shared object file: No such file or directory"
+        ).starts_with("The browser helper stopped: libjxl.so.0.12: cannot open shared object file: No such file or directory. "));
+    }
+}
+
 impl BrowserData {
     fn worker(&self) -> Result<Arc<Worker>, String> {
         let mut current = self.0.lock().unwrap();
@@ -97,10 +129,26 @@ impl BrowserData {
                 return Ok(worker);
             }
         }
-        let mut child = Command::new(helper_path()?).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()
-            .map_err(|e| format!("Could not start WebKitGTK: {e}. Install the WebKitGTK 4.1 runtime for your distribution."))?;
+        let mut child = Command::new(helper_path()?).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
+            .map_err(|e| format!("Could not start the browser helper: {e}. Install the {ENGINE} runtime for your distribution."))?;
         let stdin = child.stdin.take().unwrap();
         let mut stdout = child.stdout.take().unwrap();
+        // A helper that cannot start, such as one missing a shared library,
+        // explains itself only on stderr. Keep logging it and retain its
+        // last line for the tab's error.
+        let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+        let (reason_tx, reason_rx) = std::sync::mpsc::channel::<String>();
+        std::thread::Builder::new().name("browser-stderr".into()).spawn(move || {
+            use std::io::BufRead;
+            let (mut last, mut line) = (String::new(), Vec::new());
+            while stderr.read_until(b'\n', &mut line).is_ok_and(|n| n > 0) {
+                let text = String::from_utf8_lossy(&line).trim_end().to_owned();
+                eprintln!("{text}");
+                if !text.is_empty() { last = text; }
+                line.clear();
+            }
+            let _ = reason_tx.send(last);
+        }).map_err(|e| e.to_string())?;
         let routes: Arc<Mutex<HashMap<u32, Weak<Route>>>> = Arc::default();
         let reader_routes = routes.clone();
         std::thread::Builder::new().name("browser-frames".into()).spawn(move || {
@@ -110,17 +158,30 @@ impl BrowserData {
                     let id = u32::from_le_bytes(header[1..5].try_into().unwrap());
                     let length = u32::from_le_bytes(header[5..9].try_into().unwrap()) as usize;
                     if length > 8192 * 8192 * 4 + 12 { return Err(std::io::Error::other("Browser packet is too large")); }
-                    let mut data = vec![0; length]; stdout.read_exact(&mut data)?;
+                    // A frame is megabytes at up to the display's rate: its
+                    // pixels are read straight into the buffer the image
+                    // keeps, without zeroing it or shifting past the header.
+                    let mut frame = [0u8; 12];
+                    let data = if header[0] == b'F' && length >= frame.len() {
+                        stdout.read_exact(&mut frame)?;
+                        let pixels = length - frame.len();
+                        let mut data = Vec::with_capacity(pixels);
+                        (&mut stdout).take(pixels as u64).read_to_end(&mut data)?;
+                        if data.len() != pixels { return Err(std::io::ErrorKind::UnexpectedEof.into()); }
+                        data
+                    } else {
+                        let mut data = vec![0; length]; stdout.read_exact(&mut data)?;
+                        if header[0] == b'F' { continue; }
+                        data
+                    };
                     let route = reader_routes.lock().unwrap().get(&id).and_then(Weak::upgrade);
                     let Some(route) = route else { continue; };
                     let event = match header[0] {
                         b'F' => {
-                            if data.len() < 12 { continue; }
-                            let width = u32::from_le_bytes(data[..4].try_into().unwrap());
-                            let height = u32::from_le_bytes(data[4..8].try_into().unwrap());
-                            let scale=f32::from_bits(u32::from_le_bytes(data[8..12].try_into().unwrap()));
+                            let width = u32::from_le_bytes(frame[..4].try_into().unwrap());
+                            let height = u32::from_le_bytes(frame[4..8].try_into().unwrap());
+                            let scale=f32::from_bits(u32::from_le_bytes(frame[8..12].try_into().unwrap()));
                             if !scale.is_finite() || !(0.5..=4.).contains(&scale) {continue;}
-                            data.drain(..12);
                             let Some(pixels) = image::RgbaImage::from_raw(width, height, data) else { continue; };
                             *route.frame.lock().unwrap() = Some((Arc::new(RenderImage::new([image::Frame::new(pixels)])),scale));
                             NativeEvent::Frame
@@ -153,10 +214,11 @@ impl BrowserData {
                 }
             })();
             if result.is_err() {
+                let error = stopped_message(&reason_rx.recv_timeout(std::time::Duration::from_millis(250)).unwrap_or_default());
                 for route in reader_routes.lock().unwrap().values().filter_map(Weak::upgrade) {
                     let mut state = route.state.lock().unwrap();
                     state.loading = false;
-                    state.error = Some("The browser helper stopped. Check that WebKitGTK 4.1 is installed, then reopen the tab.".into());
+                    state.error = Some(error.clone());
                     drop(state); let _ = route.tx.try_send(NativeEvent::Changed);
                 }
             }
@@ -237,6 +299,23 @@ impl NativePage {
     }
     pub fn load(&self, url: &str) -> Result<(), String> {
         self.worker.send(self.id, json!({"cmd":"load","url":url}))
+    }
+    /// The helper bounds each command, so a document crosses the pipe in
+    /// chunks. Escaping a chunk can grow it sixfold and still fit.
+    pub fn load_html(&self, html: &str) -> Result<(), String> {
+        const CHUNK: usize = 128 * 1024;
+        let mut rest = html;
+        while !rest.is_empty() {
+            let mut end = rest.len().min(CHUNK);
+            while !rest.is_char_boundary(end) {
+                end -= 1;
+            }
+            let (chunk, tail) = rest.split_at(end);
+            self.worker
+                .send(self.id, json!({"cmd":"html","data":chunk}))?;
+            rest = tail;
+        }
+        self.worker.send(self.id, json!({"cmd":"load-html"}))
     }
     pub fn reload(&self) {
         self.command(json!({"cmd":"reload"}));
@@ -345,6 +424,9 @@ impl super::BrowserSurface {
                 let mut page = native.state();
                 if page.url.is_none() {
                     page.url = self.page.url.clone();
+                }
+                if let Some(document) = &self.document {
+                    document.describe(&mut page);
                 }
                 if page.error.is_some() {
                     page.loading = false;

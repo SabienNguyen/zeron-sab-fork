@@ -27,6 +27,18 @@ pub(crate) struct MediaImage {
 
 const PREVIEW_PIXELS: usize = 1024 * 1024;
 const MAX_RASTER_SIDE: f64 = 4096.0;
+/// Most pixels one on-screen region of an SVG may be drawn with.
+const REGION_PIXELS: usize = 4 * PREVIEW_PIXELS;
+
+/// A part of a prepared SVG drawn on its own, for a magnified view.
+#[derive(Clone)]
+pub(crate) struct MediaRegion {
+    pub image: Arc<Image>,
+    /// `[x, y, w, h]` of the part, in the SVG's natural units.
+    pub rect: [f32; 4],
+    /// Raster pixels per natural unit actually drawn.
+    pub density: f32,
+}
 // GPUI's SvgRenderer rasterizes SVG images at twice their declared dimensions.
 const GPUI_SVG_SCALE: f64 = 2.0;
 
@@ -46,6 +58,12 @@ fn raster_size(
         .min(MAX_RASTER_SIDE / w)
         .min(MAX_RASTER_SIDE / h)
         .min((pixels.max(1) as f64 / (w * h)).sqrt());
+    scaled_size(w, h, scale, pixels)
+}
+
+/// Whole-pixel raster dimensions at `scale`, held inside the pixel budget
+/// even when a one-pixel minimum side would exceed it.
+fn scaled_size(w: f64, h: f64, scale: f64, pixels: usize) -> (u32, u32) {
     let mut size = (
         (w * scale).floor().max(1.0) as u32,
         (h * scale).floor().max(1.0) as u32,
@@ -69,10 +87,14 @@ fn svg_retained_bytes(svg: &str, raster: (u32, u32)) -> usize {
 impl MediaImage {
     /// Preserve the sanitized vector source; only the outer raster viewport changes.
     pub(crate) fn for_view(&self, viewport: (f32, f32), dpi: f32, pixels: usize) -> Self {
+        let size = raster_size(self.width, self.height, viewport, dpi, pixels);
+        self.with_raster(size)
+    }
+
+    fn with_raster(&self, size: (u32, u32)) -> Self {
         let Some(svg) = &self.svg else {
             return self.clone();
         };
-        let size = raster_size(self.width, self.height, viewport, dpi, pixels);
         if self.raster_size == Some(size) {
             return self.clone();
         }
@@ -111,6 +133,51 @@ impl MediaImage {
         self.for_view(viewport, dpi, PREVIEW_PIXELS)
     }
 
+    /// Width in device pixels of the raster a prepared SVG currently holds.
+    pub(crate) fn raster_width(&self) -> Option<u32> {
+        self.raster_size.map(|(width, _)| width)
+    }
+
+    /// One part of this SVG drawn at `density` raster pixels per natural
+    /// unit. A viewer scales the texture it is given, so a raster of the
+    /// whole image turns soft once magnified and a large diagram cannot be
+    /// held at reading resolution. Drawing only what is on screen keeps any
+    /// zoom sharp for at most a viewport of pixels. `rect` is `[x, y, w, h]`
+    /// in natural units; the density drops to fit `available` memory and the
+    /// raster limits. `None` for media with no vector source to redraw.
+    pub(crate) fn region(
+        &self,
+        rect: [f32; 4],
+        density: f32,
+        available: usize,
+    ) -> Option<MediaRegion> {
+        let svg = self.svg.as_ref()?;
+        let [x, y, w, h] = rect;
+        if ![x, y, w, h, density].iter().all(|v| v.is_finite()) || w <= 0.0 || h <= 0.0 {
+            return None;
+        }
+        let pixels = (available.saturating_sub(svg.len() * 2 + 1024) / 8).min(REGION_PIXELS);
+        if pixels == 0 || density <= 0.0 {
+            return None;
+        }
+        let (w64, h64) = (f64::from(w), f64::from(h));
+        let scale = f64::from(density)
+            .min(MAX_RASTER_SIDE / w64)
+            .min(MAX_RASTER_SIDE / h64)
+            .min((pixels as f64 / (w64 * h64)).sqrt());
+        let size = scaled_size(w64, h64, scale, pixels);
+        let wrapper = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="{}" height="{}" viewBox="{x} {y} {w} {h}">{svg}</svg>"#,
+            size.0 as f64 / GPUI_SVG_SCALE,
+            size.1 as f64 / GPUI_SVG_SCALE,
+        );
+        Some(MediaRegion {
+            image: Arc::new(Image::from_bytes(ImageFormat::Svg, wrapper.into_bytes())),
+            rect,
+            density: scale as f32,
+        })
+    }
+
     pub(crate) fn enlarged(
         &self,
         viewport: (f32, f32),
@@ -142,12 +209,15 @@ pub(crate) fn preview_element(
     on_click: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
 ) -> gpui::AnyElement {
     use gpui::{InteractiveElement as _, IntoElement as _, StyledImage as _, prelude::*};
+    // The height follows the width through the aspect ratio, so the width
+    // must be the drawn one: a full-width box capped by `max_w` would take
+    // its height from the column instead.
+    let scale = (480.0 / loaded.height).min(1.0);
     gpui::div()
         .id(id)
-        .w_full()
-        .max_w(gpui::px(loaded.width))
+        .w(gpui::px(loaded.width * scale))
+        .max_w_full()
         .mx_auto()
-        .max_h(gpui::px(480.0))
         .aspect_ratio(loaded.width / loaded.height)
         .cursor_pointer()
         .role(gpui::Role::Button)
@@ -226,6 +296,17 @@ pub(crate) fn decode_project_icon(mime: &str, bytes: Vec<u8>) -> Result<MediaIma
         decode_image(mime, bytes).map(|media| media.for_view((16.0, 16.0), 2.0, 4096))
     } else {
         decode_raster_image_bounded(bytes, zeron_proto::MAX_WORKSPACE_IMAGE_BYTES, Some(64))
+    }
+}
+
+/// Images a chat reply draws inline: a raster keeps one static frame
+/// downsampled to at most 2048 pixels on either axis, so no single entry
+/// can exceed the transcript's media budget.
+pub(crate) fn decode_chat_image(mime: &str, bytes: Vec<u8>) -> Result<MediaImage, String> {
+    if mime == "image/svg+xml" {
+        decode_image(mime, bytes)
+    } else {
+        decode_raster_image_bounded(bytes, zeron_proto::MAX_WORKSPACE_IMAGE_BYTES, Some(2048))
     }
 }
 
@@ -421,6 +502,70 @@ mod tests {
         // A smaller raster frees memory and is always taken.
         let smaller = sharper.preview_within((100.0, 50.0), 1.0, 0);
         assert!(smaller.bytes < sharper.bytes);
+    }
+
+    #[test]
+    fn regions_draw_only_the_visible_part_at_the_requested_density() {
+        // A red left half and a blue right half, 800 natural units wide.
+        let media = decode_image(
+            "image/svg+xml",
+            br##"<svg xmlns="http://www.w3.org/2000/svg" width="800" height="1600"><rect width="400" height="1600" fill="#ff0000"/><rect x="400" width="400" height="1600" fill="#0000ff"/></svg>"##.to_vec(),
+        )
+        .unwrap();
+        let renderer = || gpui::SvgRenderer::new(Arc::new(crate::icons::Assets));
+        // Three times the natural size, where a raster of the whole image
+        // would need 2400x4800 pixels.
+        let region = media
+            .region([500.0, 100.0, 200.0, 100.0], 3.0, usize::MAX)
+            .unwrap();
+        assert_eq!(region.density, 3.0);
+        let raster = region.image.to_image_data(renderer()).unwrap();
+        let size = raster.size(0);
+        assert_eq!((size.width.0, size.height.0), (600, 300));
+        // Entirely inside the blue half (stored BGRA).
+        let bytes = raster.as_bytes(0).unwrap();
+        assert_eq!(&bytes[..4], &[255, 0, 0, 255]);
+        // A region across the seam keeps both halves in place.
+        let seam = media
+            .region([300.0, 0.0, 200.0, 100.0], 1.0, usize::MAX)
+            .unwrap();
+        let raster = seam.image.to_image_data(renderer()).unwrap();
+        let bytes = raster.as_bytes(0).unwrap();
+        let width = raster.size(0).width.0 as usize;
+        assert_eq!(&bytes[..4], &[0, 0, 255, 255]);
+        assert_eq!(&bytes[(width - 1) * 4..width * 4], &[255, 0, 0, 255]);
+        // Memory and the raster limits lower the density, never the area.
+        let wide = media
+            .region([0.0, 0.0, 800.0, 1600.0], 8.0, usize::MAX)
+            .unwrap();
+        assert!(wide.density < 8.0);
+        assert!(f64::from(1600.0 * wide.density) <= MAX_RASTER_SIDE + 1.0);
+        let tight = media
+            .region([0.0, 0.0, 800.0, 1600.0], 8.0, 1024 * 1024)
+            .unwrap();
+        assert!((800.0 * tight.density * 1600.0 * tight.density) as usize * 8 <= 1024 * 1024);
+        assert!(media.region([0.0, 0.0, 10.0, 10.0], 1.0, 0).is_none());
+        assert!(
+            media
+                .region([0.0, 0.0, 0.0, 10.0], 1.0, usize::MAX)
+                .is_none()
+        );
+        assert!(
+            media
+                .region([0.0, 0.0, f32::NAN, 10.0], 1.0, usize::MAX)
+                .is_none()
+        );
+        // Raster images have no vector source to redraw.
+        let mut png = Vec::new();
+        image::RgbaImage::new(4, 4)
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let raster = decode_image("image/png", png).unwrap();
+        assert!(
+            raster
+                .region([0.0, 0.0, 4.0, 4.0], 2.0, usize::MAX)
+                .is_none()
+        );
     }
 
     #[test]

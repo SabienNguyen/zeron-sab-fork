@@ -309,8 +309,19 @@ fn decode_source(bytes: &[u8]) -> Option<Arc<BackgroundLuminance>> {
     ))
 }
 
+const PROXY_MAX_DIMENSION: u32 = 2048;
+
 fn source_from_image(image: &image::DynamicImage) -> Arc<BackgroundLuminance> {
-    let proxy = image.thumbnail(2048, 2048);
+    // `thumbnail` also enlarges, and its one-pixel sampling leaves jagged
+    // edges near 1:1. Keep sources that already fit; filter oversized ones.
+    let resized = (image.width().max(image.height()) > PROXY_MAX_DIMENSION).then(|| {
+        image.resize(
+            PROXY_MAX_DIMENSION,
+            PROXY_MAX_DIMENSION,
+            image::imageops::FilterType::Triangle,
+        )
+    });
+    let proxy = resized.as_ref().unwrap_or(image);
     let gray = proxy.to_luma8();
     Arc::new(BackgroundLuminance {
         width: gray.width(),
@@ -429,6 +440,20 @@ mod tests {
         Arc::new(gpui::RenderImage::new([image::Frame::new(
             image::RgbaImage::new(1, 1),
         )]))
+    }
+
+    #[test]
+    fn sources_that_fit_keep_their_pixels_and_oversized_ones_shrink() {
+        let small = image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(96, 54, |x, y| {
+            image::Rgba([x as u8, y as u8, 7, 255])
+        }));
+        let source = source_from_image(&small);
+        assert_eq!((source.width, source.height), (96, 54));
+        assert_eq!(source.colors[54 + 96], [54, 1, 7, 255]);
+
+        let large = image::DynamicImage::new_rgba8(PROXY_MAX_DIMENSION * 2, 100);
+        let source = source_from_image(&large);
+        assert_eq!((source.width, source.height), (PROXY_MAX_DIMENSION, 50));
     }
 
     #[test]

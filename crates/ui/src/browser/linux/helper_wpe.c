@@ -1,5 +1,10 @@
-// WebKitGTK runs in its own process. Only rendered pixels and explicit browser
+// WPE WebKit runs in its own process. Only rendered pixels and explicit browser
 // commands cross the pipe; GPUI owns all visible windows and input routing.
+//
+// The helper is WebKit's display: it defines the screen, hands each page a
+// view, receives every rendered buffer, and supplies the vsync tick. WebKit
+// paces itself by that tick, so pages animate at the host's rate rather than
+// a toolkit's fixed 60 Hz.
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -7,31 +12,43 @@
 #include <json-glib/json-glib.h>
 #include <signal.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <webkit2/webkit2.h>
+#include <wpe/webkit.h>
+#include <wpe/wpe-platform.h>
+#include <xkbcommon/xkbcommon.h>
 
 #define MAX_COMMAND (1024 * 1024)
 #define MAX_DIMENSION 8192
 #define MAX_HTML (32 * 1024 * 1024)
+#define DEFAULT_REFRESH_HZ 144
 
 typedef struct {
     guint id;
-    GtkWidget *window;
     WebKitWebView *web;
-    gboolean visible, dirty;
+    WPEView *view;
+    WPEToplevel *toplevel;
+    gboolean visible;
     gchar *error;
     guint width, height;
     double scale;
     WebKitOptionMenu *options;
     gchar *context_link;
+    // Where the pointer last went down, for placing the context menu.
+    double press_x, press_y;
     // A workspace document is loaded from text and commits as about:blank.
     GString *html;
     gboolean local;
 } Page;
 static GHashTable *pages;
-static WebKitWebContext *context;
+static WebKitNetworkSession *session;
+static WPEDisplay *display;
+static WPEScreen *screen;
+static WPEKeymap *keymap;
+static int refresh_mhz;
 static GByteArray *input;
+static GMainLoop *main_loop;
 
 static gboolean write_all(const void *data, size_t length) {
     const char *p = data;
@@ -40,7 +57,7 @@ static gboolean write_all(const void *data, size_t length) {
         if (n < 0 && errno == EINTR)
             continue;
         if (n <= 0) {
-            gtk_main_quit();
+            g_main_loop_quit(main_loop);
             return FALSE;
         }
         p += n;
@@ -99,7 +116,7 @@ static void im_preedit(WebKitInputMethodContext *ctx, gchar **text, GList **unde
                             webkit_input_method_underline_new(0, g_utf8_strlen(im->preedit, -1)))
             : NULL;
 }
-static gboolean im_filter(WebKitInputMethodContext *ctx, GdkEventKey *event) { return FALSE; }
+static gboolean im_filter(WebKitInputMethodContext *ctx, gpointer event) { return FALSE; }
 static void im_focus(WebKitInputMethodContext *ctx, gboolean focused) {
     JsonBuilder *b = json_builder_new();
     json_builder_begin_object(b);
@@ -250,10 +267,9 @@ static void send_menu(Page *p, JsonBuilder *b) {
     json_builder_end_object(b);
     send_json('M', p->id, b);
 }
-static gboolean context_menu(WebKitWebView *web, WebKitContextMenu *menu, GdkEvent *event,
-                             WebKitHitTestResult *hit, Page *p) {
-    double x = 0, y = 0;
-    gdk_event_get_coords(event, &x, &y);
+static gboolean context_menu(WebKitWebView *web, WebKitContextMenu *menu, WebKitHitTestResult *hit,
+                             Page *p) {
+    double x = p->press_x, y = p->press_y;
     g_free(p->context_link);
     p->context_link = NULL;
     JsonBuilder *b = menu_builder(x / p->scale, y / p->scale);
@@ -275,8 +291,8 @@ static gboolean context_menu(WebKitWebView *web, WebKitContextMenu *menu, GdkEve
     send_menu(p, b);
     return TRUE;
 }
-static gboolean option_menu(WebKitWebView *web, WebKitOptionMenu *menu, GdkEvent *event,
-                            GdkRectangle *rect, Page *p) {
+static gboolean option_menu(WebKitWebView *web, WebKitOptionMenu *menu, WebKitRectangle *rect,
+                            Page *p) {
     g_set_object(&p->options, menu);
     JsonBuilder *b = menu_builder(rect->x / p->scale, (rect->y + rect->height) / p->scale);
     for (guint i = 0; i < webkit_option_menu_get_n_items(menu); i++) {
@@ -291,20 +307,202 @@ static gboolean option_menu(WebKitWebView *web, WebKitOptionMenu *menu, GdkEvent
     send_menu(p, b);
     return TRUE;
 }
-static void download(WebKitWebContext *ctx, WebKitDownload *item, gpointer data) {
+static void download(WebKitNetworkSession *s, WebKitDownload *item, gpointer data) {
     webkit_download_cancel(item);
 }
-static gboolean damaged(GtkWidget *widget, GdkEvent *event, Page *p) {
-    p->dirty = TRUE;
-    return FALSE;
+
+// ---- vsync. A ticking thread stands in for the display's vertical sync.
+G_DECLARE_FINAL_TYPE(BrowserSync, browser_sync, BROWSER, SYNC, WPEScreenSyncObserver)
+struct _BrowserSync {
+    WPEScreenSyncObserver parent;
+    GThread *thread;
+    gint running;
+};
+G_DEFINE_TYPE(BrowserSync, browser_sync, WPE_TYPE_SCREEN_SYNC_OBSERVER)
+static gpointer sync_thread(gpointer data) {
+    BrowserSync *s = data;
+    gint64 period = G_GINT64_CONSTANT(1000000000) / refresh_mhz, next = g_get_monotonic_time();
+    while (g_atomic_int_get(&s->running)) {
+        WPE_SCREEN_SYNC_OBSERVER_GET_CLASS(s)->sync(WPE_SCREEN_SYNC_OBSERVER(s));
+        next += period;
+        gint64 now = g_get_monotonic_time();
+        if (next > now)
+            g_usleep(next - now);
+        else
+            next = now;
+    }
+    g_object_unref(s);
+    return NULL;
 }
+static void sync_start(WPEScreenSyncObserver *observer) {
+    BrowserSync *s = BROWSER_SYNC(observer);
+    if (g_atomic_int_compare_and_exchange(&s->running, 0, 1))
+        s->thread = g_thread_new("browser-vsync", sync_thread, g_object_ref(s));
+}
+static void sync_stop(WPEScreenSyncObserver *observer) {
+    BrowserSync *s = BROWSER_SYNC(observer);
+    // WebKit may stop the observer from inside a tick, on the ticking thread.
+    if (g_atomic_int_compare_and_exchange(&s->running, 1, 0)) {
+        if (s->thread == g_thread_self())
+            g_thread_unref(s->thread);
+        else
+            g_thread_join(s->thread);
+        s->thread = NULL;
+    }
+}
+static void browser_sync_class_init(BrowserSyncClass *klass) {
+    WPE_SCREEN_SYNC_OBSERVER_CLASS(klass)->start = sync_start;
+    WPE_SCREEN_SYNC_OBSERVER_CLASS(klass)->stop = sync_stop;
+}
+static void browser_sync_init(BrowserSync *s) {}
+
+// ---- screen
+G_DECLARE_FINAL_TYPE(BrowserScreen, browser_screen, BROWSER, SCREEN, WPEScreen)
+struct _BrowserScreen {
+    WPEScreen parent;
+};
+G_DEFINE_TYPE(BrowserScreen, browser_screen, WPE_TYPE_SCREEN)
+static WPEScreenSyncObserver *screen_sync(WPEScreen *s) {
+    static WPEScreenSyncObserver *observer;
+    if (!observer)
+        observer = g_object_new(browser_sync_get_type(), NULL);
+    return observer;
+}
+static void browser_screen_class_init(BrowserScreenClass *klass) {
+    WPE_SCREEN_CLASS(klass)->get_sync_observer = screen_sync;
+}
+static void browser_screen_init(BrowserScreen *s) {}
+
+// ---- toplevel. One per page: it carries the size and the active state.
+G_DECLARE_FINAL_TYPE(BrowserToplevel, browser_toplevel, BROWSER, TOPLEVEL, WPEToplevel)
+struct _BrowserToplevel {
+    WPEToplevel parent;
+};
+G_DEFINE_TYPE(BrowserToplevel, browser_toplevel, WPE_TYPE_TOPLEVEL)
+static WPEScreen *toplevel_screen(WPEToplevel *t) { return screen; }
+static gboolean toplevel_resize(WPEToplevel *t, int width, int height) {
+    wpe_toplevel_resized(t, width, height);
+    return TRUE;
+}
+static void browser_toplevel_class_init(BrowserToplevelClass *klass) {
+    WPE_TOPLEVEL_CLASS(klass)->get_screen = toplevel_screen;
+    WPE_TOPLEVEL_CLASS(klass)->resize = toplevel_resize;
+}
+static void browser_toplevel_init(BrowserToplevel *t) {}
+
+// ---- view. WebKit hands over each finished buffer and waits to be told it
+// was presented; that acknowledgement is what lets the next frame start.
+G_DECLARE_FINAL_TYPE(BrowserView, browser_view, BROWSER, VIEW, WPEView)
+struct _BrowserView {
+    WPEView parent;
+    Page *page;
+};
+G_DEFINE_TYPE(BrowserView, browser_view, WPE_TYPE_VIEW)
+typedef struct {
+    WPEView *view;
+    WPEBuffer *buffer;
+} Presented;
+static gboolean presented(gpointer data) {
+    Presented *done = data;
+    wpe_view_buffer_rendered(done->view, done->buffer);
+    wpe_view_buffer_released(done->view, done->buffer);
+    g_object_unref(done->buffer);
+    g_object_unref(done->view);
+    g_free(done);
+    return G_SOURCE_REMOVE;
+}
+static void send_frame(Page *p, WPEBuffer *buffer) {
+    guint w = wpe_buffer_get_width(buffer), h = wpe_buffer_get_height(buffer);
+    // A buffer from before a resize is acknowledged but never shown.
+    if (!p->visible || w != p->width || h != p->height || w > MAX_DIMENSION || h > MAX_DIMENSION ||
+        G_BYTE_ORDER != G_LITTLE_ENDIAN)
+        return;
+    GBytes *bytes = wpe_buffer_import_to_pixels(buffer, NULL);
+    if (!bytes)
+        return;
+    gsize size;
+    const guchar *src = g_bytes_get_data(bytes, &size);
+    gsize stride = WPE_IS_BUFFER_SHM(buffer) ? wpe_buffer_shm_get_stride(WPE_BUFFER_SHM(buffer))
+                                             : (gsize)w * 4;
+    if (stride < (gsize)w * 4 || size < stride * (h - 1) + (gsize)w * 4)
+        return;
+    guint length = 12 + w * h * 4;
+    // One buffer serves every frame: a fresh megabyte-scale allocation per
+    // frame would spend its time faulting pages in.
+    static guchar *out;
+    static guint capacity;
+    if (capacity < length) {
+        out = g_realloc(out, length);
+        capacity = length;
+    }
+    ((guint32 *)out)[0] = GUINT32_TO_LE(w);
+    ((guint32 *)out)[1] = GUINT32_TO_LE(h);
+    float scale = p->scale;
+    guint32 scale_bits;
+    memcpy(&scale_bits, &scale, 4);
+    ((guint32 *)out)[2] = GUINT32_TO_LE(scale_bits);
+    // WebKit's native-endian ARGB is already the BGRA byte order of GPUI's
+    // image atlas. The page is opaque; its alpha byte carries nothing.
+    for (guint y = 0; y < h; y++) {
+        const guint32 *from = (const guint32 *)(src + (gsize)y * stride);
+        guint32 *to = (guint32 *)(out + 12 + (gsize)y * w * 4);
+        for (guint x = 0; x < w; x++)
+            to[x] = from[x] | 0xff000000u;
+    }
+    send_packet('F', p->id, out, length);
+}
+static gboolean render_buffer(WPEView *view, WPEBuffer *buffer, const WPERectangle *damage,
+                              guint n_damage, GError **error) {
+    Page *p = BROWSER_VIEW(view)->page;
+    if (p)
+        send_frame(p, buffer);
+    Presented *done = g_new(Presented, 1);
+    done->view = g_object_ref(view);
+    done->buffer = g_object_ref(buffer);
+    g_idle_add(presented, done);
+    return TRUE;
+}
+static gboolean view_can_be_mapped(WPEView *view) { return TRUE; }
+static void browser_view_class_init(BrowserViewClass *klass) {
+    WPE_VIEW_CLASS(klass)->render_buffer = render_buffer;
+    WPE_VIEW_CLASS(klass)->can_be_mapped = view_can_be_mapped;
+}
+static void browser_view_init(BrowserView *v) {}
+
+// ---- display
+G_DECLARE_FINAL_TYPE(BrowserDisplay, browser_display, BROWSER, DISPLAY, WPEDisplay)
+struct _BrowserDisplay {
+    WPEDisplay parent;
+};
+G_DEFINE_TYPE(BrowserDisplay, browser_display, WPE_TYPE_DISPLAY)
+static gboolean display_connect(WPEDisplay *d, GError **error) { return TRUE; }
+static WPEView *display_create_view(WPEDisplay *d) {
+    return g_object_new(browser_view_get_type(), "display", d, NULL);
+}
+static guint display_n_screens(WPEDisplay *d) { return 1; }
+static WPEScreen *display_screen(WPEDisplay *d, guint index) { return index ? NULL : screen; }
+static WPEKeymap *display_keymap(WPEDisplay *d) { return keymap; }
+static void browser_display_class_init(BrowserDisplayClass *klass) {
+    WPEDisplayClass *display_class = WPE_DISPLAY_CLASS(klass);
+    display_class->connect = display_connect;
+    display_class->create_view = display_create_view;
+    display_class->get_n_screens = display_n_screens;
+    display_class->get_screen = display_screen;
+    display_class->get_keymap = display_keymap;
+}
+static void browser_display_init(BrowserDisplay *d) {}
+
 static void free_page(gpointer data) {
     Page *p = data;
     if (p->options) {
         webkit_option_menu_close(p->options);
         g_clear_object(&p->options);
     }
-    gtk_widget_destroy(p->window);
+    // Buffers still in flight must not reach a page that no longer exists.
+    BROWSER_VIEW(p->view)->page = NULL;
+    g_signal_handlers_disconnect_by_data(p->web, p);
+    g_object_unref(p->web);
+    g_object_unref(p->toplevel);
     g_free(p->error);
     g_free(p->context_link);
     if (p->html)
@@ -318,16 +516,23 @@ static Page *new_page(guint id) {
     p->height = 600;
     p->scale = 1;
     p->visible = TRUE;
-    p->window = gtk_offscreen_window_new();
-    p->web = WEBKIT_WEB_VIEW(webkit_web_view_new_with_context(context));
+    p->web = g_object_new(WEBKIT_TYPE_WEB_VIEW, "display", display, "network-session", session,
+                          NULL);
+    p->view = webkit_web_view_get_wpe_view(p->web);
+    BROWSER_VIEW(p->view)->page = p;
+    p->toplevel = g_object_new(browser_toplevel_get_type(), "display", display, NULL);
+    wpe_view_set_toplevel(p->view, p->toplevel);
+    wpe_toplevel_resized(p->toplevel, p->width, p->height);
+    wpe_toplevel_state_changed(p->toplevel, WPE_TOPLEVEL_STATE_ACTIVE);
+    wpe_view_resized(p->view, p->width, p->height);
+    wpe_view_set_visible(p->view, TRUE);
+    wpe_view_map(p->view);
+    wpe_view_focus_in(p->view);
     BrowserIM *im = g_object_new(browser_im_get_type(), NULL);
     im->id = id;
     webkit_web_view_set_input_method_context(p->web, WEBKIT_INPUT_METHOD_CONTEXT(im));
     g_object_unref(im);
     webkit_settings_set_enable_developer_extras(webkit_web_view_get_settings(p->web), FALSE);
-    gtk_container_add(GTK_CONTAINER(p->window), GTK_WIDGET(p->web));
-    gtk_window_set_default_size(GTK_WINDOW(p->window), p->width, p->height);
-    g_signal_connect(p->window, "damage-event", G_CALLBACK(damaged), p);
     g_signal_connect(p->web, "notify::uri", G_CALLBACK(changed), p);
     g_signal_connect(p->web, "notify::title", G_CALLBACK(changed), p);
     g_signal_connect(p->web, "notify::is-loading", G_CALLBACK(changed), p);
@@ -338,65 +543,8 @@ static Page *new_page(guint id) {
     g_signal_connect(p->web, "permission-request", G_CALLBACK(permission), p);
     g_signal_connect(p->web, "context-menu", G_CALLBACK(context_menu), p);
     g_signal_connect(p->web, "show-option-menu", G_CALLBACK(option_menu), p);
-    gtk_widget_show_all(p->window);
     g_hash_table_insert(pages, GUINT_TO_POINTER(id), p);
     return p;
-}
-static gboolean render_frames(gpointer unused) {
-    GHashTableIter it;
-    gpointer value;
-    g_hash_table_iter_init(&it, pages);
-    while (g_hash_table_iter_next(&it, NULL, &value)) {
-        Page *p = value;
-        if (!p->visible || !p->dirty)
-            continue;
-        p->dirty = FALSE;
-        // Cairo's native-endian xRGB is already the BGRA byte order of GPUI's
-        // image atlas, so rows are copied without a per-channel conversion.
-        cairo_surface_t *backing = gtk_offscreen_window_get_surface(GTK_OFFSCREEN_WINDOW(p->window));
-        if (!backing)
-            continue;
-        cairo_surface_t *image = cairo_surface_map_to_image(backing, NULL);
-        cairo_format_t format = cairo_image_surface_get_format(image);
-        if (cairo_surface_status(image) != CAIRO_STATUS_SUCCESS ||
-            (format != CAIRO_FORMAT_ARGB32 && format != CAIRO_FORMAT_RGB24) ||
-            G_BYTE_ORDER != G_LITTLE_ENDIAN) {
-            cairo_surface_unmap_image(backing, image);
-            continue;
-        }
-        cairo_surface_flush(image);
-        guint w = cairo_image_surface_get_width(image), h = cairo_image_surface_get_height(image);
-        guint stride = cairo_image_surface_get_stride(image);
-        const guchar *src = cairo_image_surface_get_data(image);
-        if (w > MAX_DIMENSION || h > MAX_DIMENSION) {
-            cairo_surface_unmap_image(backing, image);
-            continue;
-        }
-        if (w != p->width || h != p->height) {
-            p->dirty = TRUE;
-            cairo_surface_unmap_image(backing, image);
-            continue;
-        }
-        guint length = 12 + w * h * 4;
-        guchar *out = g_malloc(length);
-        ((guint32 *)out)[0] = GUINT32_TO_LE(w);
-        ((guint32 *)out)[1] = GUINT32_TO_LE(h);
-        float scale = p->scale;
-        guint32 scale_bits;
-        memcpy(&scale_bits, &scale, 4);
-        ((guint32 *)out)[2] = GUINT32_TO_LE(scale_bits);
-        for (guint y = 0; y < h; y++) {
-            guint32 *row = (guint32 *)(out + 12 + (gsize)y * w * 4);
-            memcpy(row, src + (gsize)y * stride, (gsize)w * 4);
-            // The page is opaque; RGB24 leaves its alpha byte undefined.
-            for (guint x = 0; x < w; x++)
-                row[x] |= 0xff000000u;
-        }
-        send_packet('F', p->id, out, length);
-        g_free(out);
-        cairo_surface_unmap_image(backing, image);
-    }
-    return G_SOURCE_CONTINUE;
 }
 static double number(JsonObject *o, const char *key) {
     return json_object_has_member(o, key) ? json_object_get_double_member(o, key) : 0;
@@ -404,69 +552,63 @@ static double number(JsonObject *o, const char *key) {
 static const char *string(JsonObject *o, const char *key) {
     return json_object_has_member(o, key) ? json_object_get_string_member(o, key) : "";
 }
+// GPUI sends GDK's modifier bits; the pointer buttons already agree.
+static WPEModifiers modifiers(guint mods) {
+    return (mods & (1 << 0) ? WPE_MODIFIER_KEYBOARD_SHIFT : 0) |
+           (mods & (1 << 2) ? WPE_MODIFIER_KEYBOARD_CONTROL : 0) |
+           (mods & (1 << 3) ? WPE_MODIFIER_KEYBOARD_ALT : 0) |
+           (mods & (1 << 26) ? WPE_MODIFIER_KEYBOARD_META : 0) | (mods & (0x1f << 8));
+}
+// GPUI sends wheel deltas in GDK smooth-scroll units. Measured against the
+// page, this factor moves it as far per unit as WebKitGTK did.
+#define SCROLL_UNIT 48.0
 static void input_event(Page *p, JsonObject *o, const char *command) {
-    GdkEventType type = !strcmp(command, "move")       ? GDK_MOTION_NOTIFY
-                        : !strcmp(command, "down")     ? GDK_BUTTON_PRESS
-                        : !strcmp(command, "up")       ? GDK_BUTTON_RELEASE
-                        : !strcmp(command, "scroll")   ? GDK_SCROLL
-                        : !strcmp(command, "key_down") ? GDK_KEY_PRESS
-                                                       : GDK_KEY_RELEASE;
-    GdkEvent *e = gdk_event_new(type);
-    GdkWindow *window = gtk_widget_get_window(GTK_WIDGET(p->web));
-    e->any.window = g_object_ref(window);
-    e->any.send_event = TRUE;
-    GdkSeat *seat = gdk_display_get_default_seat(gdk_window_get_display(window));
-    gboolean key = type == GDK_KEY_PRESS || type == GDK_KEY_RELEASE;
-    if (seat)
-        gdk_event_set_device(e, key ? gdk_seat_get_keyboard(seat) : gdk_seat_get_pointer(seat));
     guint32 time = (guint32)(g_get_monotonic_time() / 1000);
-    guint mods = number(o, "mods");
+    WPEModifiers mods = modifiers(number(o, "mods"));
     double x = number(o, "x") * p->scale, y = number(o, "y") * p->scale;
-    if (type == GDK_MOTION_NOTIFY) {
-        e->motion.time = time;
-        e->motion.x = x;
-        e->motion.y = y;
-        e->motion.state = mods;
-    } else if (type == GDK_SCROLL) {
-        e->scroll.time = time;
-        e->scroll.x = x;
-        e->scroll.y = y;
-        e->scroll.state = mods;
-        e->scroll.direction = GDK_SCROLL_SMOOTH;
-        e->scroll.delta_x = number(o, "dx");
-        e->scroll.delta_y = number(o, "dy");
-    } else if (key) {
-        e->key.time = time;
-        e->key.state = mods;
-        e->key.keyval = gdk_keyval_from_name(string(o, "key"));
-        if (e->key.keyval == GDK_KEY_VoidSymbol) {
-            gunichar u = g_utf8_get_char_validated(string(o, "key"), -1);
+    WPEEvent *event = NULL;
+    if (!strcmp(command, "move")) {
+        event = wpe_event_pointer_move_new(WPE_EVENT_POINTER_MOVE, p->view, WPE_INPUT_SOURCE_MOUSE,
+                                           time, mods, x, y, 0, 0);
+    } else if (!strcmp(command, "down") || !strcmp(command, "up")) {
+        gboolean down = *command == 'd';
+        guint button = number(o, "button");
+        if (down) {
+            p->press_x = x;
+            p->press_y = y;
+            wpe_view_focus_in(p->view);
+        }
+        event = wpe_event_pointer_button_new(
+            down ? WPE_EVENT_POINTER_DOWN : WPE_EVENT_POINTER_UP, p->view, WPE_INPUT_SOURCE_MOUSE,
+            time, mods, button, x, y,
+            down ? wpe_view_compute_press_count(p->view, x, y, button, time) : 0);
+    } else if (!strcmp(command, "scroll")) {
+        event = wpe_event_scroll_new(p->view, WPE_INPUT_SOURCE_MOUSE, time, mods,
+                                     -number(o, "dx") * SCROLL_UNIT, -number(o, "dy") * SCROLL_UNIT,
+                                     TRUE, FALSE, x, y);
+    } else if (!strcmp(command, "key_down") || !strcmp(command, "key_up")) {
+        const char *name = string(o, "key");
+        guint keyval = xkb_keysym_from_name(name, XKB_KEYSYM_NO_FLAGS);
+        if (keyval == XKB_KEY_NoSymbol) {
+            gunichar u = g_utf8_get_char_validated(name, -1);
             if (u != (gunichar)-1 && u != (gunichar)-2)
-                e->key.keyval = gdk_unicode_to_keyval(u);
+                keyval = wpe_unicode_to_keyval(u);
         }
-        e->key.string = g_strdup(string(o, "text"));
-        e->key.length = strlen(e->key.string);
-        GdkKeymapKey *keys = NULL;
-        gint count = 0;
-        if (gdk_keymap_get_entries_for_keyval(
-                gdk_keymap_get_for_display(gdk_window_get_display(window)), e->key.keyval, &keys,
-                &count) &&
-            count) {
-            e->key.hardware_keycode = keys[0].keycode;
-            e->key.group = keys[0].group;
-            g_free(keys);
+        guint keycode = 0;
+        WPEKeymapEntry *entries = NULL;
+        guint count = 0;
+        if (wpe_keymap_get_entries_for_keyval(keymap, keyval, &entries, &count) && count) {
+            keycode = entries[0].keycode;
+            g_free(entries);
         }
-    } else {
-        e->button.time = time;
-        e->button.x = x;
-        e->button.y = y;
-        e->button.state = mods;
-        e->button.button = number(o, "button");
-        if (type == GDK_BUTTON_PRESS)
-            gtk_widget_grab_focus(GTK_WIDGET(p->web));
+        event = wpe_event_keyboard_new(
+            !strcmp(command, "key_down") ? WPE_EVENT_KEYBOARD_KEY_DOWN : WPE_EVENT_KEYBOARD_KEY_UP,
+            p->view, WPE_INPUT_SOURCE_KEYBOARD, time, mods, keycode, keyval);
     }
-    gtk_widget_event(GTK_WIDGET(p->web), e);
-    gdk_event_free(e);
+    if (event) {
+        wpe_view_event(p->view, event);
+        wpe_event_unref(event);
+    }
 }
 static void copied(GObject *web, GAsyncResult *result, gpointer data) {
     GError *error = NULL;
@@ -590,18 +732,17 @@ static void command(JsonObject *o) {
             p->height = h;
             p->scale = scale;
             webkit_web_view_set_zoom_level(p->web, scale);
-            gtk_window_set_default_size(GTK_WINDOW(p->window), w, h);
-            gtk_widget_set_size_request(GTK_WIDGET(p->web), w, h);
-            gtk_widget_queue_resize(p->window);
-            p->dirty = TRUE;
+            wpe_toplevel_resized(p->toplevel, w, h);
+            wpe_view_resized(p->view, w, h);
         }
     } else if (!strcmp(cmd, "visible")) {
+        // A hidden page stops being composited instead of painting unseen frames.
         p->visible = number(o, "value") != 0;
-        if (p->visible) {
-            gtk_widget_show(p->window);
-            p->dirty = TRUE;
-        } else
-            gtk_widget_hide(p->window);
+        wpe_view_set_visible(p->view, p->visible);
+        if (p->visible)
+            wpe_view_map(p->view);
+        else
+            wpe_view_unmap(p->view);
     } else if (!strcmp(cmd, "eval"))
         webkit_web_view_evaluate_javascript(p->web, string(o, "script"), -1, NULL, NULL, NULL,
                                             evaluated, GUINT_TO_POINTER(id));
@@ -612,7 +753,7 @@ static gboolean read_commands(gint fd, GIOCondition condition, gpointer unused) 
     guint8 bytes[65536];
     ssize_t n = read(fd, bytes, sizeof bytes);
     if (n <= 0) {
-        gtk_main_quit();
+        g_main_loop_quit(main_loop);
         return G_SOURCE_REMOVE;
     }
     g_byte_array_append(input, bytes, n);
@@ -621,7 +762,7 @@ static gboolean read_commands(gint fd, GIOCondition condition, gpointer unused) 
         memcpy(&length, input->data, 4);
         length = GUINT32_FROM_LE(length);
         if (length > MAX_COMMAND) {
-            gtk_main_quit();
+            g_main_loop_quit(main_loop);
             return G_SOURCE_REMOVE;
         }
         if (input->len < 4 + length)
@@ -641,23 +782,31 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     // A frame is megabytes; the default 64 KiB pipe costs a wakeup per chunk.
     fcntl(STDOUT_FILENO, F_SETPIPE_SZ, 1024 * 1024);
-    // Offscreen GTK surfaces need CPU-addressable frames, never native GL child windows.
-    g_setenv("WEBKIT_DISABLE_DMABUF_RENDERER", "1", TRUE);
-    g_setenv("GDK_SCALE", "1", TRUE);
-    g_setenv("GDK_DPI_SCALE", "1", TRUE);
-    if (!gtk_init_check(&argc, &argv)) {
-        g_printerr("Could not connect WebKitGTK to the display.\n");
+    // The display's rate is not visible from here; the host may state it.
+    const char *hz = g_getenv("ZERON_BROWSER_REFRESH_HZ");
+    double rate = hz ? g_ascii_strtod(hz, NULL) : 0;
+    refresh_mhz = (rate >= 24 && rate <= 480 ? rate : DEFAULT_REFRESH_HZ) * 1000;
+    screen = g_object_new(browser_screen_get_type(), "id", 1, NULL);
+    wpe_screen_set_size(screen, MAX_DIMENSION, MAX_DIMENSION);
+    wpe_screen_set_scale(screen, 1);
+    wpe_screen_set_refresh_rate(screen, refresh_mhz);
+    keymap = wpe_keymap_xkb_new();
+    display = g_object_new(browser_display_get_type(), NULL);
+    GError *error = NULL;
+    if (!wpe_display_connect(display, &error)) {
+        g_printerr("Could not start the WPE WebKit display: %s\n", error->message);
         return 1;
     }
     pages = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, free_page);
     input = g_byte_array_new();
-    context = webkit_web_context_new_ephemeral();
-    g_signal_connect(context, "download-started", G_CALLBACK(download), NULL);
+    session = webkit_network_session_new_ephemeral();
+    g_signal_connect(session, "download-started", G_CALLBACK(download), NULL);
     g_unix_fd_add(STDIN_FILENO, G_IO_IN | G_IO_HUP | G_IO_ERR, read_commands, NULL);
-    g_timeout_add(16, render_frames, NULL);
-    gtk_main();
+    GMainLoop *loop = g_main_loop_new(NULL, FALSE);
+    main_loop = loop;
+    g_main_loop_run(loop);
     g_hash_table_destroy(pages);
     g_byte_array_unref(input);
-    g_object_unref(context);
+    g_object_unref(session);
     return 0;
 }

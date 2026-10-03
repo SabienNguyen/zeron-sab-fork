@@ -215,6 +215,11 @@ impl Shell {
                             cx.open_url(&url);
                         }
                     }
+                    FilesEvent::PreviewHtml { path, html }
+                        if this.accepts_file_navigation(&owner, &source, cx) =>
+                    {
+                        this.open_html_preview(path.clone(), html.clone(), window, cx);
+                    }
                     FilesEvent::ShowAllFilesChanged(show_all) => {
                         this.set_files_show_all(*show_all, cx)
                     }

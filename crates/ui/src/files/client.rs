@@ -186,6 +186,32 @@ impl WorkspaceFilesClient {
         self.call(methods::READ_WORKSPACE_FILE, &request).await
     }
 
+    /// [`Self::read_image`] under this client's own context. An absolute
+    /// path names a host file outside every checkout and reads without a
+    /// checkout identity. Legacy chats and plain folders may not carry one
+    /// in synced metadata; the owning host then supplies it.
+    pub async fn read_context_image(
+        &self,
+        path: String,
+    ) -> Result<(String, Vec<u8>), FilesClientError> {
+        let checkout = if super::path_is_outside(&path) {
+            String::new()
+        } else {
+            match self.context.checkout_id.clone().filter(|id| !id.is_empty()) {
+                Some(id) => id,
+                None => {
+                    self.read_file(ReadWorkspaceFileRequest {
+                        target: self.context.target.clone(),
+                        path: path.clone(),
+                    })
+                    .await?
+                    .checkout_id
+                }
+            }
+        };
+        self.read_image(path, checkout).await
+    }
+
     pub async fn read_image(
         &self,
         path: String,
