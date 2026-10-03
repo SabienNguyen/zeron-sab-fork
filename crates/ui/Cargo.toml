@@ -87,6 +87,16 @@ roxmltree = "0.21.1"
 png = "0.18"
 thiserror.workspace = true
 rust-embed = "=8.7.2"
+# Native HTML preview. Sticky positioning and table borders need upstream's
+# main branch; the anyrender and stylo versions are the ones that commit uses.
+blitz-dom = { git = "https://github.com/DioxusLabs/blitz", rev = "65c3dfd2937bd7d39d8c906cd280bea7d90742f8" }
+blitz-html = { git = "https://github.com/DioxusLabs/blitz", rev = "65c3dfd2937bd7d39d8c906cd280bea7d90742f8" }
+blitz-paint = { git = "https://github.com/DioxusLabs/blitz", rev = "65c3dfd2937bd7d39d8c906cd280bea7d90742f8" }
+blitz-traits = { git = "https://github.com/DioxusLabs/blitz", rev = "65c3dfd2937bd7d39d8c906cd280bea7d90742f8" }
+anyrender = "0.14"
+anyrender_vello_cpu = { version = "0.18", features = ["multithreading"] }
+peniko = "0.6"
+stylo = "0.22"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc.workspace = true

@@ -603,6 +603,8 @@ impl FilesSurface {
                     view.update(cx, |view, cx| view.suspend(cx));
                 }
             }
+            // Nor to a rendered page.
+            document.show_html = false;
         }
         cx.notify();
     }
@@ -1928,6 +1930,11 @@ impl FilesSurface {
                     view.update(cx, |view, cx| view.suspend(cx));
                 }
             }
+            let html = is_html(new_document_path);
+            if is_html(old_document_path) != html {
+                document.show_html = html;
+                document.html = None;
+            }
             if let Some(file) = document.file.as_mut() {
                 file.path = new_document_path.clone();
             }
@@ -2310,7 +2317,12 @@ impl FilesSurface {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let markdown = super::markdown_preview::is_markdown(path);
-        let html = is_html(path) && self.html_preview_source(path, cx).is_some();
+        let html = is_html(path);
+        let showing_html = self
+            .preview
+            .documents
+            .get(path)
+            .is_some_and(|d| d.show_html);
         let showing_markdown = self
             .preview
             .documents
@@ -2462,22 +2474,57 @@ impl FilesSurface {
                 )
             })
             .when(html, |element| {
-                element.child(
-                    toolbar_button("files-preview-html", "Preview HTML")
-                        .on_click(cx.listener(|this, _, _, cx| {
+                element
+                    .child(
+                        toolbar_button(
+                            "files-toggle-html",
+                            if showing_html {
+                                "Show HTML code"
+                            } else {
+                                "Preview HTML"
+                            },
+                        )
+                        .when(showing_html, |el| el.bg(crate::theme::wash(0.1)))
+                        .on_click(cx.listener(|this, _, window, cx| {
                             let Some(path) = this.preview.active.clone() else {
                                 return;
                             };
-                            if let Some(html) = this.html_preview_source(&path, cx) {
-                                cx.emit(FilesEvent::PreviewHtml { path, html });
+                            let Some(document) = this.preview.documents.get_mut(&path) else {
+                                return;
+                            };
+                            document.show_html = !document.show_html;
+                            if !document.show_html {
+                                this.focus_editor(window, cx);
                             }
+                            cx.notify();
                         }))
                         .child(
-                            icon(icons::EYE)
-                                .size(px(crate::surface_chrome::ICON_SIZE))
-                                .text_color(theme.text_muted),
+                            icon(if showing_html {
+                                icons::FILE_CODE
+                            } else {
+                                icons::EYE
+                            })
+                            .size(px(crate::surface_chrome::ICON_SIZE))
+                            .text_color(theme.text_muted),
                         ),
-                )
+                    )
+                    // The native preview runs no scripts; a Browser tab does.
+                    .child(
+                        toolbar_button("files-open-html-browser", "Open in Browser tab")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let Some(path) = this.preview.active.clone() else {
+                                    return;
+                                };
+                                if let Some(html) = this.html_preview_source(&path, cx) {
+                                    cx.emit(FilesEvent::PreviewHtml { path, html });
+                                }
+                            }))
+                            .child(
+                                icon(icons::GLOBE)
+                                    .size(px(crate::surface_chrome::ICON_SIZE))
+                                    .text_color(theme.text_muted),
+                            ),
+                    )
             })
             .when_some(save_status, |element, (label, color, retry, detail)| {
                 element.child(
@@ -2565,6 +2612,57 @@ impl FilesSurface {
             Some(editor) => Some(editor.read(cx).value().to_string()),
             None => file.text.clone(),
         }
+    }
+
+    /// The rendered page for `path`, fed from the same text a Browser tab
+    /// would get. Links that leave the page go through the Markdown
+    /// preview's routing: web links open a Browser tab, paths open files.
+    fn prepare_html_preview(
+        &mut self,
+        path: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<super::html_preview::HtmlPreview>> {
+        if !self.preview.documents.get(path).is_some_and(|d| {
+            d.show_html && !matches!(d.phase, DocumentPhase::Loading | DocumentPhase::Error(_))
+        }) {
+            return None;
+        }
+        let source = self.html_preview_source(path, cx)?;
+        let chat_id = self.chat_id.clone();
+        let owner = cx.weak_entity();
+        let document = self.preview.documents.get_mut(path)?;
+        let version = (
+            document.generation,
+            document.revision,
+            document.loaded_hash.clone(),
+        );
+        let view = document
+            .html
+            .get_or_insert_with(|| {
+                cx.new(|cx| {
+                    super::html_preview::HtmlPreview::new(
+                        Rc::new(move |href, cx| {
+                            let activation = crate::markdown::render::LinkActivation {
+                                target: crate::markdown::links::LinkTarget::new(href, href),
+                                action: crate::markdown::render::LinkAction::Primary,
+                                source_session: Some(chat_id.clone()),
+                            };
+                            let _ = owner.update(cx, |_, cx| {
+                                cx.emit(FilesEvent::OpenWebLink(activation));
+                            });
+                        }),
+                        cx,
+                    )
+                })
+            })
+            .clone();
+        if view.read(cx).version.as_ref() != Some(&version) {
+            view.update(cx, |view, _| {
+                view.version = Some(version);
+                view.set_source(source);
+            });
+        }
+        Some(view)
     }
 
     fn markdown_web_link_handler(cx: &Context<Self>) -> super::markdown_preview::WebLinkHandler {
@@ -2721,6 +2819,7 @@ impl FilesSurface {
             && let Some(document) = self.preview.documents.get_mut(path)
         {
             document.show_markdown = false;
+            document.show_html = false;
         }
         let editor = self.ensure_editor(path, theme, window, cx);
         self.apply_line_navigation(path, editor.as_ref(), window, cx);
@@ -2735,6 +2834,9 @@ impl FilesSurface {
             .is_some_and(|file| {
                 file.read_only_reason == Some(WorkspaceReadOnlyReason::OutsideWorkspace)
             });
+        if let Some(view) = self.prepare_html_preview(path, cx) {
+            return view.into_any_element();
+        }
         if let Some(view) = self.prepare_markdown_preview(path, editor.as_ref(), cx) {
             return if outside {
                 div()
@@ -3159,7 +3261,7 @@ impl FilesSurface {
             return None;
         }
         let text = document.file.as_ref()?.text.clone()?;
-        let focus_editor = !document.show_markdown;
+        let focus_editor = !document.show_markdown && !document.show_html;
         let editor =
             super::editor::new_file_editor(text, path, self.preview.word_wrap, theme, window, cx);
         let event_path = path.to_string();

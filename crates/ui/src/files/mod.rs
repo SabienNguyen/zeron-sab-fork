@@ -24,6 +24,8 @@ mod drag;
 pub mod editor;
 pub mod editor_adapter;
 mod git_status;
+mod html_preview;
+mod html_render;
 mod image_preview;
 pub(crate) mod markdown_media;
 mod markdown_preview;

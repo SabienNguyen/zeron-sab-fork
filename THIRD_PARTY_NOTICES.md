@@ -130,6 +130,19 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+## Native HTML preview
+
+The file panel's HTML preview is laid out and painted by
+[Blitz](https://github.com/DioxusLabs/blitz) (MIT OR Apache-2.0), pinned to
+commit `65c3dfd`, with [AnyRender](https://github.com/DioxusLabs/anyrender)
+and `vello_cpu` (MIT OR Apache-2.0) for rasterization and
+[Stylo](https://github.com/servo/stylo) (MPL-2.0) for CSS. Exact versions and
+transitive dependencies are pinned in `Cargo.lock`.
+
+`vendor/stylo_derive` is a copy of `stylo_derive` 0.22.0 (MPL-2.0) with one
+modification, described in its README. Its source files keep their MPL-2.0
+notices; the license text is at <https://mozilla.org/MPL/2.0/>.
+
 ## Native browser host
 
 The macOS browser uses [Wry 0.56.0](https://github.com/tauri-apps/wry/tree/wry-v0.56.0)

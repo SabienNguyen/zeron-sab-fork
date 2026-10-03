@@ -20,6 +20,7 @@ members = [
     "crates/text",
     "apps/zeron",
 ]
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.2.102"
@@ -173,3 +174,7 @@ inherits = "release"
 lto = "thin"
 codegen-units = 1
 strip = "debuginfo"
+
+# See vendor/stylo_derive/README.md.
+[patch.crates-io]
+stylo_derive = { path = "vendor/stylo_derive" }
