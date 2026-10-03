@@ -2,6 +2,8 @@
 //! played through the platform's own audio CLI, zero Rust audio deps):
 //!
 //! - embedded completion, input-request, attention and Appshot chimes;
+//! - each session chime can be replaced by a user-chosen audio file
+//!   ([`CustomSounds`]); an unplayable file falls back to the embedded chime;
 //! - macOS Appshots use a preloaded native player; other cues write to a
 //!   temp file and use the system player on a
 //!   background thread: `afplay` (macOS), PowerShell `Media.SoundPlayer`
@@ -15,6 +17,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 
 const DISABLE_ENV: &str = "ZERON_DISABLE_SOUND";
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -37,15 +41,81 @@ pub enum Sound {
     Attention,
 }
 
-/// Play a chime on a background thread. Silently a no-op when disabled or no
-/// player is available.
-pub fn play(sound: Sound) {
+impl Sound {
+    /// Desktop banner body for the transition this chime announces.
+    pub fn banner_body(self) -> &'static str {
+        match self {
+            Sound::Done => "Run finished",
+            Sound::Request => "Waiting on your input",
+            Sound::Attention => "Run failed",
+        }
+    }
+}
+
+/// User-chosen replacements for the embedded session chimes. Files are
+/// referenced in place, so a moved or deleted file plays the embedded chime.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CustomSounds {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attention: Option<PathBuf>,
+}
+
+impl CustomSounds {
+    pub fn get(&self, sound: Sound) -> Option<&Path> {
+        match sound {
+            Sound::Done => self.completion.as_deref(),
+            Sound::Request => self.input.as_deref(),
+            Sound::Attention => self.attention.as_deref(),
+        }
+    }
+
+    pub fn set(&mut self, sound: Sound, path: Option<PathBuf>) {
+        match sound {
+            Sound::Done => self.completion = path,
+            Sound::Request => self.input = path,
+            Sound::Attention => self.attention = path,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// Extensions this platform's system player decodes: `afplay` (macOS),
+/// `Media.SoundPlayer` (Windows, WAV only), libsndfile/ffmpeg players (Linux).
+#[cfg(target_os = "macos")]
+pub const CUSTOM_SOUND_EXTENSIONS: &[&str] = &["wav", "aiff", "aif", "mp3", "m4a", "caf", "flac"];
+#[cfg(windows)]
+pub const CUSTOM_SOUND_EXTENSIONS: &[&str] = &["wav"];
+#[cfg(not(any(windows, target_os = "macos")))]
+pub const CUSTOM_SOUND_EXTENSIONS: &[&str] = &["wav", "ogg", "oga", "flac", "mp3"];
+
+/// Whether `path` names an audio format the system player can decode.
+pub fn is_supported_custom_sound(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            CUSTOM_SOUND_EXTENSIONS
+                .iter()
+                .any(|supported| ext.eq_ignore_ascii_case(supported))
+        })
+}
+
+/// Play a chime on a background thread, preferring the user's `custom` file.
+/// Silently a no-op when disabled or no player is available.
+pub fn play(sound: Sound, custom: Option<&Path>) {
     let data = match sound {
         Sound::Done => SOUND_DONE,
         Sound::Request => SOUND_REQUEST,
         Sound::Attention => SOUND_ATTENTION,
     };
-    play_in_background(data);
+    play_in_background(data, custom.map(Path::to_path_buf));
 }
 
 /// Confirm captured pixels with a soft shutter and clear chime.
@@ -59,7 +129,7 @@ pub fn play_appshot() {
         return;
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    play_in_background(SOUND_APPSHOT);
+    play_in_background(SOUND_APPSHOT, None);
 }
 
 /// Load the macOS capture cue before the first capture, without playing it.
@@ -111,7 +181,7 @@ mod macos_appshot {
                                 "Appshot native playback requested"
                             );
                             if !played {
-                                super::play_in_background(super::SOUND_APPSHOT);
+                                super::play_in_background(super::SOUND_APPSHOT, None);
                             }
                         }
                     })
@@ -166,11 +236,19 @@ mod macos_appshot {
     }
 }
 
-fn play_in_background(data: &'static [u8]) {
+fn play_in_background(data: &'static [u8], custom: Option<PathBuf>) {
     if std::env::var_os(DISABLE_ENV).is_some() {
         return;
     }
     std::thread::spawn(move || {
+        if let Some(path) = custom {
+            match run_player(&path) {
+                Ok(()) => return,
+                Err(err) => {
+                    tracing::debug!(error = %err, "custom sound failed; using the embedded chime")
+                }
+            }
+        }
         if let Err(err) = play_bytes(data) {
             tracing::debug!(error = %err, "sound playback failed");
         }
@@ -262,8 +340,15 @@ fn run_player(path: &Path) -> Result<(), String> {
         ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "quiet"]),
         ("mpv", &["--no-video", "--really-quiet"]),
     ];
+    // Custom sounds may be compressed, which aplay would play as raw noise.
+    let wav = path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"));
     let mut errors = Vec::new();
     for (program, args) in players {
+        if *program == "aplay" && !wav {
+            continue;
+        }
         match run_checked(program, args, path) {
             Ok(()) => return Ok(()),
             Err(err) => errors.push(err),
@@ -291,7 +376,10 @@ fn run_checked(program: &str, args: &[&str], path: &Path) -> Result<(), String> 
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(format!("{program} timed out"));
+                    // Audible until the cut-off (a long custom file), so not
+                    // a failure: an error would replay it on the next player.
+                    tracing::debug!(program, "sound playback cut off at the time limit");
+                    return Ok(());
                 }
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
@@ -495,6 +583,29 @@ mod tests {
         let last = baseline(Indicator::None, Some("second"));
         assert_eq!(last.sound_since(&second, false), Some(Sound::Done));
         assert_eq!(last.sound_since(&last, false), None);
+    }
+
+    #[test]
+    fn custom_sounds_map_each_chime_and_skip_unset_fields_on_disk() {
+        let mut custom = CustomSounds::default();
+        assert!(custom.is_empty());
+        assert_eq!(serde_json::to_string(&custom).unwrap(), "{}");
+        custom.set(Sound::Request, Some("/tmp/ask.wav".into()));
+        assert_eq!(custom.get(Sound::Request), Some(Path::new("/tmp/ask.wav")));
+        assert_eq!(custom.get(Sound::Done), None);
+        assert_eq!(custom.get(Sound::Attention), None);
+        let json = serde_json::to_string(&custom).unwrap();
+        assert_eq!(json, r#"{"input":"/tmp/ask.wav"}"#);
+        assert_eq!(serde_json::from_str::<CustomSounds>(&json).unwrap(), custom);
+        custom.set(Sound::Request, None);
+        assert!(custom.is_empty());
+    }
+
+    #[test]
+    fn custom_sound_support_is_decided_by_extension() {
+        assert!(is_supported_custom_sound(Path::new("/tmp/Ding.WAV")));
+        assert!(!is_supported_custom_sound(Path::new("/tmp/notes.txt")));
+        assert!(!is_supported_custom_sound(Path::new("/tmp/wav")));
     }
 
     #[test]

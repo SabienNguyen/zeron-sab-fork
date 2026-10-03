@@ -2713,19 +2713,14 @@ impl Shell {
                                 .attention_sound_gate
                                 .should_play(std::time::Instant::now());
                         if should_play {
-                            crate::sound::play(sound);
+                            crate::sound::play(sound, self.settings.custom_sounds.get(sound));
                         }
                     }
                     if self.settings.notifications_enabled
                         && !(self.settings.notifications_background_only && app_focused)
                     {
                         let title = title.unwrap_or_else(|| "New session".into());
-                        let body = match sound {
-                            crate::sound::Sound::Done => "Run finished",
-                            crate::sound::Sound::Request => "Waiting on your input",
-                            crate::sound::Sound::Attention => "Run failed",
-                        };
-                        crate::notify::post(&title, body, Some(&chat_id));
+                        crate::notify::post(&title, sound.banner_body(), Some(&chat_id));
                     }
                 }
             }
@@ -2739,7 +2734,7 @@ impl Shell {
                         .attention_sound_gate
                         .should_play(std::time::Instant::now())
                 {
-                    crate::sound::play(sound);
+                    crate::sound::play(sound, self.settings.custom_sounds.get(sound));
                 }
                 if self.settings.notifications_enabled
                     && !(self.settings.notifications_background_only && app_focused)
@@ -4920,6 +4915,7 @@ impl Shell {
                             self.settings.sound_completion_enabled,
                             self.settings.sound_input_enabled,
                             self.settings.sound_attention_enabled,
+                            self.settings.custom_sounds.clone(),
                             self.settings.notifications_enabled,
                             self.settings.notifications_background_only,
                             self.settings.agent_update_notifications,
@@ -4935,14 +4931,16 @@ impl Shell {
                                 completion_sound,
                                 input_sound,
                                 attention_sound,
+                                custom_sounds,
                                 desktop,
                                 background_only,
                                 agent_updates,
-                            } = *event;
+                            } = event.clone();
                             this.settings.sound_enabled = sound;
                             this.settings.sound_completion_enabled = completion_sound;
                             this.settings.sound_input_enabled = input_sound;
                             this.settings.sound_attention_enabled = attention_sound;
+                            this.settings.custom_sounds = custom_sounds;
                             this.settings.notifications_enabled = desktop;
                             this.settings.notifications_background_only = background_only;
                             this.settings.agent_update_notifications = agent_updates;
