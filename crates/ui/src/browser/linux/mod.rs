@@ -1,4 +1,5 @@
-//! WebKitGTK renders offscreen in an isolated helper process. GPUI composites
+//! WebKit renders offscreen in an isolated helper process, built on WPE WebKit
+//! where it is available and WebKitGTK otherwise. GPUI composites
 //! its frames, so browser content uses the same clipping and blur as other UI.
 use super::model::{PageState, Presentation};
 use gpui::{Bounds, Pixels, RenderImage};
@@ -82,17 +83,21 @@ fn helper_path() -> Result<std::path::PathBuf, String> {
         .map_err(|e| e.to_string())?;
     Ok(path)
 }
+/// The engine the embedded helper was built against.
+const ENGINE: &str = env!("ZERON_BROWSER_ENGINE");
+
 /// The dynamic loader prefixes its complaint with the helper's cache path.
 fn stopped_message(reason: &str) -> String {
     let reason = reason
         .split_once(": error while loading shared libraries: ")
         .map_or(reason, |(_, library)| library);
     if reason.is_empty() {
-        "The browser helper stopped. Check that WebKitGTK 4.1 is installed, then reopen the tab."
-            .into()
+        format!(
+            "The browser helper stopped. Check that {ENGINE} is installed, then reopen the tab."
+        )
     } else {
         format!(
-            "The browser helper stopped: {reason}. Check that WebKitGTK 4.1 and the libraries it needs are installed, then reopen the tab."
+            "The browser helper stopped: {reason}. Check that {ENGINE} and the libraries it needs are installed, then reopen the tab."
         )
     }
 }
@@ -125,7 +130,7 @@ impl BrowserData {
             }
         }
         let mut child = Command::new(helper_path()?).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
-            .map_err(|e| format!("Could not start WebKitGTK: {e}. Install the WebKitGTK 4.1 runtime for your distribution."))?;
+            .map_err(|e| format!("Could not start the browser helper: {e}. Install the {ENGINE} runtime for your distribution."))?;
         let stdin = child.stdin.take().unwrap();
         let mut stdout = child.stdout.take().unwrap();
         // A helper that cannot start, such as one missing a shared library,
@@ -153,17 +158,30 @@ impl BrowserData {
                     let id = u32::from_le_bytes(header[1..5].try_into().unwrap());
                     let length = u32::from_le_bytes(header[5..9].try_into().unwrap()) as usize;
                     if length > 8192 * 8192 * 4 + 12 { return Err(std::io::Error::other("Browser packet is too large")); }
-                    let mut data = vec![0; length]; stdout.read_exact(&mut data)?;
+                    // A frame is megabytes at up to the display's rate: its
+                    // pixels are read straight into the buffer the image
+                    // keeps, without zeroing it or shifting past the header.
+                    let mut frame = [0u8; 12];
+                    let data = if header[0] == b'F' && length >= frame.len() {
+                        stdout.read_exact(&mut frame)?;
+                        let pixels = length - frame.len();
+                        let mut data = Vec::with_capacity(pixels);
+                        (&mut stdout).take(pixels as u64).read_to_end(&mut data)?;
+                        if data.len() != pixels { return Err(std::io::ErrorKind::UnexpectedEof.into()); }
+                        data
+                    } else {
+                        let mut data = vec![0; length]; stdout.read_exact(&mut data)?;
+                        if header[0] == b'F' { continue; }
+                        data
+                    };
                     let route = reader_routes.lock().unwrap().get(&id).and_then(Weak::upgrade);
                     let Some(route) = route else { continue; };
                     let event = match header[0] {
                         b'F' => {
-                            if data.len() < 12 { continue; }
-                            let width = u32::from_le_bytes(data[..4].try_into().unwrap());
-                            let height = u32::from_le_bytes(data[4..8].try_into().unwrap());
-                            let scale=f32::from_bits(u32::from_le_bytes(data[8..12].try_into().unwrap()));
+                            let width = u32::from_le_bytes(frame[..4].try_into().unwrap());
+                            let height = u32::from_le_bytes(frame[4..8].try_into().unwrap());
+                            let scale=f32::from_bits(u32::from_le_bytes(frame[8..12].try_into().unwrap()));
                             if !scale.is_finite() || !(0.5..=4.).contains(&scale) {continue;}
-                            data.drain(..12);
                             let Some(pixels) = image::RgbaImage::from_raw(width, height, data) else { continue; };
                             *route.frame.lock().unwrap() = Some((Arc::new(RenderImage::new([image::Frame::new(pixels)])),scale));
                             NativeEvent::Frame
