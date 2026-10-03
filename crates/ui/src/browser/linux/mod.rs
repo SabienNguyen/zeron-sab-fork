@@ -82,6 +82,33 @@ fn helper_path() -> Result<std::path::PathBuf, String> {
         .map_err(|e| e.to_string())?;
     Ok(path)
 }
+/// The dynamic loader prefixes its complaint with the helper's cache path.
+fn stopped_message(reason: &str) -> String {
+    let reason = reason
+        .split_once(": error while loading shared libraries: ")
+        .map_or(reason, |(_, library)| library);
+    if reason.is_empty() {
+        "The browser helper stopped. Check that WebKitGTK 4.1 is installed, then reopen the tab."
+            .into()
+    } else {
+        format!(
+            "The browser helper stopped: {reason}. Check that WebKitGTK 4.1 and the libraries it needs are installed, then reopen the tab."
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn stopped_message_names_the_reason_the_helper_gave() {
+        assert!(stopped_message("").starts_with("The browser helper stopped. "));
+        assert!(stopped_message(
+            "/home/a/.cache/zeron/browser/webkit-1f: error while loading shared libraries: libjxl.so.0.12: cannot open shared object file: No such file or directory"
+        ).starts_with("The browser helper stopped: libjxl.so.0.12: cannot open shared object file: No such file or directory. "));
+    }
+}
+
 impl BrowserData {
     fn worker(&self) -> Result<Arc<Worker>, String> {
         let mut current = self.0.lock().unwrap();
@@ -97,10 +124,26 @@ impl BrowserData {
                 return Ok(worker);
             }
         }
-        let mut child = Command::new(helper_path()?).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()
+        let mut child = Command::new(helper_path()?).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
             .map_err(|e| format!("Could not start WebKitGTK: {e}. Install the WebKitGTK 4.1 runtime for your distribution."))?;
         let stdin = child.stdin.take().unwrap();
         let mut stdout = child.stdout.take().unwrap();
+        // A helper that cannot start, such as one missing a shared library,
+        // explains itself only on stderr. Keep logging it and retain its
+        // last line for the tab's error.
+        let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+        let (reason_tx, reason_rx) = std::sync::mpsc::channel::<String>();
+        std::thread::Builder::new().name("browser-stderr".into()).spawn(move || {
+            use std::io::BufRead;
+            let (mut last, mut line) = (String::new(), Vec::new());
+            while stderr.read_until(b'\n', &mut line).is_ok_and(|n| n > 0) {
+                let text = String::from_utf8_lossy(&line).trim_end().to_owned();
+                eprintln!("{text}");
+                if !text.is_empty() { last = text; }
+                line.clear();
+            }
+            let _ = reason_tx.send(last);
+        }).map_err(|e| e.to_string())?;
         let routes: Arc<Mutex<HashMap<u32, Weak<Route>>>> = Arc::default();
         let reader_routes = routes.clone();
         std::thread::Builder::new().name("browser-frames".into()).spawn(move || {
@@ -153,10 +196,11 @@ impl BrowserData {
                 }
             })();
             if result.is_err() {
+                let error = stopped_message(&reason_rx.recv_timeout(std::time::Duration::from_millis(250)).unwrap_or_default());
                 for route in reader_routes.lock().unwrap().values().filter_map(Weak::upgrade) {
                     let mut state = route.state.lock().unwrap();
                     state.loading = false;
-                    state.error = Some("The browser helper stopped. Check that WebKitGTK 4.1 is installed, then reopen the tab.".into());
+                    state.error = Some(error.clone());
                     drop(state); let _ = route.tx.try_send(NativeEvent::Changed);
                 }
             }
