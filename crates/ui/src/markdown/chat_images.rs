@@ -46,6 +46,11 @@ fn admits(path: &str, outside: bool) -> bool {
     // Agents routinely write screenshots and plots to scratch directories,
     // and the file never leaves the reader's own devices.
     let _ = outside;
+    is_image_path(path)
+}
+
+/// Whether `path` names a format the workspace image reader serves.
+pub(crate) fn is_image_path(path: &str) -> bool {
     path.rsplit_once('.')
         .is_some_and(|(_, extension)| EXTENSIONS.iter().any(|e| extension.eq_ignore_ascii_case(e)))
 }

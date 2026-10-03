@@ -2141,6 +2141,48 @@ pub fn detail_height(detail: &ToolDetail) -> f32 {
     DETAIL_SEPARATOR + body
 }
 
+/// Height of the thumbnail strip an open chip appends for its images, and
+/// of one thumbnail inside it. Fixed, like every detail height: an image
+/// that loads, fails or is still on its way never changes the row.
+pub const CHIP_IMAGES_HEIGHT: f32 = 120.0;
+const CHIP_IMAGE_THUMB: f32 = 104.0;
+/// Widest a thumbnail grows for a panoramic image.
+const CHIP_IMAGE_MAX_WIDTH: f32 = 240.0;
+/// Images one chip shows; a thought naming more keeps the first ones.
+const MAX_CHIP_IMAGES: usize = 4;
+
+/// Image sources an open chip shows under its detail: the file a read or
+/// write names, or the images a thought's (or folded note's) Markdown holds.
+fn chip_image_sources(tool: &ToolItem) -> Vec<&str> {
+    match tool.kind {
+        ToolItemKind::Call => match &tool.call {
+            ToolCall::ReadFile { path } | ToolCall::WriteFile { path, .. }
+                if chat_images::is_image_path(path) =>
+            {
+                vec![path]
+            }
+            _ => Vec::new(),
+        },
+        ToolItemKind::Thought | ToolItemKind::Note => {
+            let Some(ToolDetail::Thought { lines, .. }) = tool.detail.as_deref() else {
+                return Vec::new();
+            };
+            let mut sources: Vec<&str> = Vec::new();
+            // A wrapped image run repeats on each of its lines.
+            for image in lines
+                .iter()
+                .flatten()
+                .filter_map(|run| run.style.image.as_ref())
+            {
+                if !sources.contains(&image.source.as_str()) {
+                    sources.push(&image.source);
+                }
+            }
+            sources
+        }
+    }
+}
+
 /// Height of the "Show full output/diff" affordance row appended below an
 /// open detail whose full payload lives in the sidecar (chat2-sync A3).
 pub const BLOB_AFFORDANCE_HEIGHT: f32 = 24.0;
@@ -6034,6 +6076,135 @@ impl Transcript {
         media
     }
 
+    /// The thumbnail strip under each mounted chip of a tool group, `None`
+    /// for a chip with no image this chat's device can read. Thumbnails
+    /// share the inline image cache and its read loop; the strip's height is
+    /// fixed, so a result only repaints.
+    fn chip_image_strips(
+        &mut self,
+        row_id: &SharedString,
+        tools: &[ToolItem],
+        mounted: &[bool],
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<Option<AnyElement>> {
+        let sources: Vec<Vec<&str>> = tools
+            .iter()
+            .zip(mounted)
+            .map(|(tool, mounted)| {
+                if *mounted {
+                    chip_image_sources(tool)
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
+        // The common case, every frame: nothing to resolve.
+        let link = if sources.iter().all(Vec::is_empty) {
+            None
+        } else {
+            self.link_ui(cx)
+                .and_then(|link| link.source_session.zip(link.file_roots))
+        };
+        let Some((chat, roots)) = link else {
+            return tools.iter().map(|_| None).collect();
+        };
+        sources
+            .into_iter()
+            .enumerate()
+            .map(|(ix, sources)| {
+                let mut reads: Vec<chat_images::ImageRead> = Vec::new();
+                for source in sources {
+                    if reads.len() == MAX_CHIP_IMAGES {
+                        break;
+                    }
+                    if let Some(read) = chat_images::resolve(source, &chat, &roots)
+                        && !reads.contains(&read)
+                    {
+                        reads.push(read);
+                    }
+                }
+                if reads.is_empty() {
+                    return None;
+                }
+                let thumbs = reads.into_iter().enumerate().map(|(n, read)| {
+                    let lookup = self
+                        .images
+                        .borrow_mut()
+                        .request_for_row(&read.key(), row_id);
+                    let slot = div()
+                        .id(SharedString::from(format!("{row_id}#d{ix}-image-{n}")))
+                        .h(px(CHIP_IMAGE_THUMB))
+                        .w(px(CHIP_IMAGE_THUMB))
+                        .flex_none()
+                        .rounded(px(6.0))
+                        .overflow_hidden();
+                    match lookup {
+                        mermaid_cache::Lookup::Ready(media) => {
+                            let width = (CHIP_IMAGE_THUMB * media.width / media.height)
+                                .clamp(CHIP_IMAGE_THUMB / 2.0, CHIP_IMAGE_MAX_WIDTH);
+                            let name: SharedString = read
+                                .path
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or_default()
+                                .to_owned()
+                                .into();
+                            let image = media.image.clone();
+                            slot.w(px(width))
+                                .cursor_pointer()
+                                .role(gpui::Role::Button)
+                                .aria_label("Enlarge image")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    let available = mermaid_cache::MAX_RETAINED_BYTES
+                                        .saturating_sub(this.images.borrow().retained_bytes());
+                                    this.open_media_preview(
+                                        media.clone(),
+                                        crate::attachments::PreviewImage::new(
+                                            name.clone(),
+                                            media.image.clone(),
+                                        ),
+                                        available,
+                                        window,
+                                        cx,
+                                    );
+                                }))
+                                .child(
+                                    gpui::img(image)
+                                        .size_full()
+                                        .rounded(px(6.0))
+                                        .object_fit(gpui::ObjectFit::Contain),
+                                )
+                        }
+                        lookup => slot
+                            .bg(crate::theme::ink(0.045))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(11.0))
+                            .text_color(theme.text_faint)
+                            .when(matches!(lookup, mermaid_cache::Lookup::Failed(_)), |slot| {
+                                slot.child("Unavailable")
+                            }),
+                    }
+                });
+                Some(
+                    div()
+                        .h(px(CHIP_IMAGES_HEIGHT))
+                        .flex_none()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .overflow_hidden()
+                        .children(thumbs.collect::<Vec<_>>())
+                        .into_any_element(),
+                )
+            })
+            .collect()
+    }
+
     /// Read requested images one at a time through the owning chat's
     /// workspace file context. Like the diagram loop, the next read is picked
     /// between loads, so rows that scrolled away meanwhile are skipped.
@@ -7741,6 +7912,20 @@ impl Transcript {
         } else {
             CHIP_HEIGHT
         };
+        // Thumbnails under each chip whose body is mounted (open, or still
+        // closing). Only these request their images, so a collapsed group or
+        // a closed chip never starts a read.
+        let mounted: Vec<bool> = detail_opens
+            .iter()
+            .zip(&detail_folds)
+            .map(|(open, fold)| {
+                *open
+                    || fold
+                        .toggled_at
+                        .is_some_and(|at| at.elapsed() < FOLD_TWEEN_WINDOW)
+            })
+            .collect();
+        let mut image_strips = self.chip_image_strips(row_id, tools, &mounted, theme, cx);
         let mut motion_active = false;
         let row_heights: Vec<f32> = details
             .iter()
@@ -7748,36 +7933,44 @@ impl Transcript {
             .zip(&affordances)
             .zip(&detail_opens)
             .zip(&detail_folds)
-            .map(|((((detail, invocation), affordance), open), fold)| {
-                let target = if *open {
-                    base_row_height
-                        + invocation.as_deref().map_or(0.0, detail_height)
-                        + detail.as_deref().map_or(0.0, detail_height)
-                        + if affordance.is_some() {
-                            BLOB_AFFORDANCE_HEIGHT
-                        } else {
-                            0.0
+            .zip(&image_strips)
+            .map(
+                |(((((detail, invocation), affordance), open), fold), images)| {
+                    let target = if *open {
+                        base_row_height
+                            + invocation.as_deref().map_or(0.0, detail_height)
+                            + detail.as_deref().map_or(0.0, detail_height)
+                            + if images.is_some() {
+                                CHIP_IMAGES_HEIGHT
+                            } else {
+                                0.0
+                            }
+                            + if affordance.is_some() {
+                                BLOB_AFFORDANCE_HEIGHT
+                            } else {
+                                0.0
+                            }
+                    } else {
+                        base_row_height
+                    };
+                    if !cx.reduce_motion() {
+                        if let Some(at) = fold.toggled_at {
+                            let t = TOOL_FOLD
+                                .curve
+                                .eval(at.elapsed().as_secs_f32() / TOOL_FOLD.total().as_secs_f32());
+                            if t < 1.0 {
+                                motion_active = true;
+                            }
+                            return motion::lerp(
+                                fold.from + base_row_height - CHIP_CARD_HEIGHT,
+                                target,
+                                t,
+                            );
                         }
-                } else {
-                    base_row_height
-                };
-                if !cx.reduce_motion() {
-                    if let Some(at) = fold.toggled_at {
-                        let t = TOOL_FOLD
-                            .curve
-                            .eval(at.elapsed().as_secs_f32() / TOOL_FOLD.total().as_secs_f32());
-                        if t < 1.0 {
-                            motion_active = true;
-                        }
-                        return motion::lerp(
-                            fold.from + base_row_height - CHIP_CARD_HEIGHT,
-                            target,
-                            t,
-                        );
                     }
-                }
-                target
-            })
+                    target
+                },
+            )
             .collect();
         let reduce_motion = cx.reduce_motion();
         let now = Instant::now();
@@ -8075,6 +8268,9 @@ impl Transcript {
                                     .when(!collapses, |line| line.bg(crate::theme::hairline(0.06))),
                             )
                             .child(detail_body(detail, detail_highlights[ix].clone(), theme));
+                    }
+                    if let Some(images) = image_strips[ix].take() {
+                        panel = panel.child(images);
                     }
                     if let Some(ChipAffordance { blob_ref, label }) = affordance {
                         let loading = matches!(
@@ -14062,6 +14258,106 @@ mod tests {
                     this.close_diagram_zoom(cx);
                     assert!(this.attachment_preview.is_none());
                 });
+            });
+        }
+
+        #[test]
+        fn timeline_images_load_only_under_open_chips_at_a_fixed_height() {
+            with_window(|transcript, window, cx| {
+                let mut read = tool_part("read", "");
+                if let MessagePart::Tool { call, .. } = &mut read {
+                    *call = ToolCall::ReadFile {
+                        path: "/tmp/shot.png".into(),
+                    };
+                }
+                let thought = reasoning_part(
+                    "thought",
+                    "Compare ![chart](/tmp/chart.png) with ![web](https://example.com/a.png).",
+                );
+                let text = format!("Done. {}", "More detail. ".repeat(300));
+                let group_height = |cx: &gpui::App| {
+                    let this = transcript.read(cx);
+                    let ix = this
+                        .rows
+                        .iter()
+                        .position(|row| row.id.as_ref() == "reply#g0");
+                    this.list.bounds_for_item(ix.unwrap()).unwrap().size.height
+                };
+                let queued = |cx: &mut gpui::App| {
+                    transcript.update(cx, |this, _| this.images.borrow_mut().next_job())
+                };
+                let open = FoldState {
+                    open: Some(true),
+                    ..Default::default()
+                };
+                transcript.update(cx, |this, cx| {
+                    this.rail_enabled = false;
+                    this.set_workspace_link_handler(render::LinkUi {
+                        source_session: None,
+                        source_local: true,
+                        file_roots: None,
+                        handler: Rc::new(|_, _, _| render::LinkOutcome::Rejected),
+                    });
+                    let reply = assistant(
+                        "reply",
+                        MessageStatus::Complete,
+                        vec![read, thought, text_part("text", &text)],
+                    );
+                    feed(this, vec![prompt("prompt"), reply], cx);
+                    this.pinned = false;
+                    let ix = this
+                        .rows
+                        .iter()
+                        .position(|row| row.id.as_ref() == "reply#g0");
+                    this.list.scroll_to(ListOffset {
+                        item_ix: ix.unwrap(),
+                        offset_in_item: px(0.0),
+                    });
+                    // The group is open, its chips are not.
+                    this.folds.insert("reply#g0".into(), open);
+                    cx.notify();
+                });
+                draw(window, cx);
+                assert!(
+                    queued(cx).is_none(),
+                    "a closed chip must not read its image"
+                );
+                let closed = group_height(cx);
+
+                transcript.update(cx, |this, cx| {
+                    this.tool_details.insert("reply#g0#d0".into(), open);
+                    this.tool_details.insert("reply#g0#d1".into(), open);
+                    cx.notify();
+                });
+                draw(window, cx);
+                let opened = group_height(cx);
+                assert!(
+                    opened >= closed + px(2.0 * CHIP_IMAGES_HEIGHT),
+                    "{closed:?} {opened:?}"
+                );
+
+                // The read file and the thought's local image load; the web
+                // image never does. Results repaint without moving anything.
+                let mut png = std::io::Cursor::new(Vec::new());
+                image::RgbaImage::new(320, 200)
+                    .write_to(&mut png, image::ImageFormat::Png)
+                    .unwrap();
+                let media =
+                    crate::image_media::decode_chat_image("image/png", png.into_inner()).unwrap();
+                let mut keys = Vec::new();
+                while let Some(key) = queued(cx) {
+                    let result = if key.ends_with("shot.png") {
+                        Ok(media.clone())
+                    } else {
+                        Err("file not found".into())
+                    };
+                    transcript.update(cx, |this, cx| this.finish_image(key.clone(), result, cx));
+                    keys.push(key);
+                }
+                keys.sort();
+                assert_eq!(keys, ["chat\n/tmp/chart.png", "chat\n/tmp/shot.png"]);
+                draw(window, cx);
+                assert_eq!(group_height(cx), opened);
             });
         }
 

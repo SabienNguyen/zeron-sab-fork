@@ -58,6 +58,10 @@ Web images are never fetched. A reply can be steered by whatever the agent read,
 
 Images use the same lazy cache as diagrams, with the same streaming rule: a block requests its images only once a later row of the reply follows it or the reply completes, and shows its text until the image is ready, so completion changes the row height at most once. Reads are serialized per transcript with a 30-second deadline and the 8 MiB workspace image limit. Rasters keep one static frame downsampled to at most 2048 pixels on either axis; SVG is sanitized as in the file preview. Retained images have their own 64 MiB budget and 64-entry cap, evicted least recently painted first. A failed read is not retried until its entry is evicted, and a file rewritten at the same path keeps its first image while retained.
 
+### Images in the activity timeline
+
+The collapsible timeline of thoughts and tool calls shows images as a strip of thumbnails under an expanded step: the file a read or write names when it is an image, and the local images a thought's Markdown holds, at most four per step. A click opens the lightbox. Timeline rows use analytic heights for their fold tween, so the strip is a fixed 120px whether its images are loading, loaded or unavailable; a result repaints and never moves the row. Only a step whose body is mounted requests its images, so a collapsed group or a closed step starts no read, and a frame with no open image step resolves nothing. Thumbnails share the inline image cache, read loop and budget. Images a tool returns as data rather than as a file, such as an MCP screenshot, are not in the session document and are not shown.
+
 ## Implementation validation
 
 The implementation was checked on Linux with the following commands:
@@ -90,3 +94,7 @@ The Zeron diagram style was checked with `cargo test -p zeron-ui --lib -- --test
 ### Images in chat follow-up
 
 Inline chat images were checked on Linux with `cargo test -p zeron-ui --lib -- --test-threads=1` (1559 passed) and `cargo check -p zeron`. Unit tests cover source resolution against the chat roots, outside files and `file://` URLs, and the rejection of web, `data:`, escaping and non-image sources. A transcript test verifies that a streaming tail starts no read, that a completed reply queues only its local images, that a loaded image replaces its text at its natural size while a failed one keeps it, and that the lightbox opens and closes. That test exposed the shared preview box taking its height from the column width instead of the image's; the box now has a definite width, which also applies to the file preview and chat diagrams. Native visual verification in the running application was not performed.
+
+### Timeline images follow-up
+
+Timeline thumbnails were checked on Linux with `cargo test -p zeron-ui --lib -- --test-threads=1` and `cargo check -p zeron`. A transcript test verifies that a closed step queues no read, that opening a file-read step and a thought adds one fixed strip each, that only their local images are queued, and that a loaded and a failed result leave the row height unchanged. Native visual verification in the running application was not performed.
