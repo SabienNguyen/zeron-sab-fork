@@ -958,6 +958,8 @@ pub struct PreviewImage {
     pub(crate) viewer: crate::image_viewer::ImageView,
     /// Fill behind an image drawn on a transparent canvas (diagrams).
     pub(crate) plate: Option<gpui::Hsla>,
+    /// A sharper drawing of the part on screen, painted over the image.
+    pub(crate) detail: Option<crate::image_viewer::Detail>,
 }
 
 impl PreviewImage {
@@ -967,11 +969,18 @@ impl PreviewImage {
             image,
             viewer: Default::default(),
             plate: None,
+            detail: None,
         }
     }
 
     pub(crate) fn with_plate(mut self, plate: gpui::Hsla) -> Self {
         self.plate = Some(plate);
+        self
+    }
+
+    /// Zoom with a bare mouse wheel: a diagram has nothing to scroll.
+    pub(crate) fn with_wheel_zoom(self) -> Self {
+        self.viewer.zoom_on_wheel();
         self
     }
 }
@@ -1019,6 +1028,7 @@ pub(crate) fn lightbox_with_size(
             natural,
             None,
             preview.plate,
+            preview.detail.clone(),
             window,
             cx,
         ),
