@@ -3055,6 +3055,21 @@ impl SavedViewportCache {
     }
 }
 
+/// Redraw the lightbox raster once the zoom outgrows it by this factor.
+const DIAGRAM_ZOOM_SHARPEN: f32 = 1.1;
+/// Redraw smaller once the view needs under this share of the raster's width.
+const DIAGRAM_ZOOM_RELEASE: f32 = 0.5;
+
+/// A diagram open in the lightbox.
+struct DiagramZoom {
+    /// The row's prepared diagram; owned by the diagram cache.
+    source: crate::image_media::MediaImage,
+    /// The raster the lightbox is drawing.
+    shown: crate::image_media::MediaImage,
+    /// A raster for the current zoom, still decoding.
+    pending: Option<crate::image_media::MediaImage>,
+}
+
 pub struct Transcript {
     state: Entity<AppState>,
     list: ListState,
@@ -3269,9 +3284,9 @@ pub struct Transcript {
     diagram_media: Option<render::MediaUi>,
     /// The single serialized diagram render loop, while requests remain.
     diagram_worker: Option<Task<()>>,
-    /// Prepared diagram shown in the lightbox: its natural size frames the
-    /// enlarged raster, which is released when the lightbox closes.
-    diagram_zoom: Option<crate::image_media::MediaImage>,
+    /// Diagram shown in the lightbox: its natural size frames the enlarged
+    /// raster, which follows the viewer's zoom and is released on close.
+    diagram_zoom: Option<DiagramZoom>,
     /// In-flight ReadAttachmentChunk loads, keyed by device, path and validation
     /// policy; results land in the global attachment cache.
     attachment_loads: HashMap<crate::attachments::AttachmentKey, Task<()>>,
@@ -5879,9 +5894,15 @@ impl Transcript {
                             )
                         };
                         let toggle = owner.clone();
+                        let enlarge = owner.clone();
                         render::DiagramView::Diagram(render::DiagramUi {
                             body,
                             show_source,
+                            enlarge: Some(Rc::new(move |window, cx| {
+                                let _ = enlarge.update(cx, |this, cx| {
+                                    this.open_diagram_preview(media.clone(), window, cx)
+                                });
+                            })),
                             toggle_source: Rc::new(move |_, cx| {
                                 let _ = toggle.update(cx, |this, cx| {
                                     this.diagrams.borrow_mut().toggle_source(&id);
@@ -6001,24 +6022,80 @@ impl Transcript {
         );
         self.attachment_preview_return_focus = window.focused(cx);
         self.attachment_preview = Some(
-            crate::attachments::PreviewImage::new("Mermaid diagram", enlarged.image)
+            crate::attachments::PreviewImage::new("Mermaid diagram", enlarged.image.clone())
                 .with_plate(crate::markdown::mermaid::Palette::plate(Theme::of(cx))),
         );
-        self.diagram_zoom = Some(source);
+        self.diagram_zoom = Some(DiagramZoom {
+            source,
+            shown: enlarged,
+            pending: None,
+        });
         window.focus(&self.attachment_preview_focus, cx);
         cx.notify();
     }
 
-    /// Release a diagram lightbox's dedicated raster. The row's own preview
-    /// stays with the diagram cache.
-    fn close_diagram_zoom(&mut self, cx: &mut gpui::App) {
-        let Some(source) = self.diagram_zoom.take() else {
+    /// Keep the diagram lightbox sharp at the viewer's zoom. The viewer only
+    /// scales the texture it is given, so a raster made for the fitted view
+    /// blurs once magnified. Redraw the vector source for the current zoom,
+    /// one raster at a time, and swap it in only once it is decoded so the
+    /// diagram never blanks mid-zoom.
+    fn refine_diagram_zoom(&mut self, window: &mut Window, cx: &mut gpui::App) {
+        let available = mermaid_cache::MAX_RETAINED_BYTES
+            .saturating_sub(self.diagrams.borrow().retained_bytes());
+        let (Some(zoom), Some(preview)) = (&mut self.diagram_zoom, &mut self.attachment_preview)
+        else {
             return;
         };
-        if let Some(preview) = self.attachment_preview.take()
-            && !Arc::ptr_eq(&preview.image, &source.image)
-        {
-            cx.defer(move |cx| gpui::ImageSource::Image(preview.image).evict(None, cx));
+        if let Some(next) = zoom.pending.take() {
+            if next.image.clone().use_render_image(window, cx).is_none() {
+                zoom.pending = Some(next);
+                return;
+            }
+            let old = std::mem::replace(&mut preview.image, next.image.clone());
+            if !Arc::ptr_eq(&old, &zoom.source.image) {
+                cx.defer(move |cx| gpui::ImageSource::Image(old).evict(None, cx));
+            }
+            zoom.shown = next;
+        }
+        let Some(scale) = preview.viewer.scale() else {
+            return;
+        };
+        let Some(wanted) = zoom.source.zoomed(scale, window.scale_factor(), available) else {
+            return;
+        };
+        let (Some(have), Some(want)) = (zoom.shown.raster_width(), wanted.raster_width()) else {
+            return;
+        };
+        // Redraw when the shown raster is visibly short of the zoom, or
+        // holds far more pixels than a zoomed-out view can use.
+        let (have, want) = (have as f32, want as f32);
+        if want > have * DIAGRAM_ZOOM_SHARPEN || want < have * DIAGRAM_ZOOM_RELEASE {
+            // Starts the decode; this view repaints when it lands.
+            let _ = wanted.image.clone().use_render_image(window, cx);
+            zoom.pending = Some(wanted);
+        }
+    }
+
+    /// Release a diagram lightbox's dedicated rasters. The row's own preview
+    /// stays with the diagram cache.
+    fn close_diagram_zoom(&mut self, cx: &mut gpui::App) {
+        let Some(zoom) = self.diagram_zoom.take() else {
+            return;
+        };
+        let retired = self
+            .attachment_preview
+            .take()
+            .map(|preview| preview.image)
+            .into_iter()
+            .chain(zoom.pending.map(|pending| pending.image))
+            .filter(|image| !Arc::ptr_eq(image, &zoom.source.image))
+            .collect::<Vec<_>>();
+        if !retired.is_empty() {
+            cx.defer(move |cx| {
+                for image in retired {
+                    gpui::ImageSource::Image(image).evict(None, cx);
+                }
+            });
         }
     }
 
@@ -9274,13 +9351,14 @@ impl Render for Transcript {
             .child(rail);
         // Full-size viewer for a clicked user-bubble thumbnail
         // (AttachmentPreviewDialog: bare lightbox, click closes).
+        self.refine_diagram_zoom(window, cx);
         if let Some(preview) = self.attachment_preview.clone() {
             let weak = cx.weak_entity();
             // A diagram's enlarged raster is framed by its natural size.
             let natural_size = self
                 .diagram_zoom
                 .as_ref()
-                .map(|source| size(px(source.width), px(source.height)));
+                .map(|zoom| size(px(zoom.source.width), px(zoom.source.height)));
             return root.child(crate::attachments::lightbox_with_size(
                 window,
                 &preview,
@@ -13567,6 +13645,35 @@ mod tests {
                 })
                 .unwrap();
                 draw(window, cx);
+                // Magnifying redraws the diagram for the zoom instead of
+                // stretching the fitted raster, and swaps it in once decoded.
+                let fitted = transcript.update(cx, |this, _| {
+                    let preview = this.attachment_preview.as_ref().expect("lightbox");
+                    preview.viewer.test_zoom(4.0);
+                    this.diagram_zoom.as_ref().unwrap().shown.raster_width()
+                });
+                // The decode runs on a background thread; repaint until it lands.
+                for _ in 0..500 {
+                    transcript.update(cx, |_, cx| cx.notify());
+                    draw(window, cx);
+                    let zoom = transcript.read(cx).diagram_zoom.as_ref().unwrap();
+                    if zoom.pending.is_none() && zoom.shown.raster_width() > fitted {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                transcript.update(cx, |this, _| {
+                    let zoom = this.diagram_zoom.as_ref().unwrap();
+                    assert!(zoom.pending.is_none(), "the zoomed raster never landed");
+                    assert!(
+                        zoom.shown.raster_width() > fitted,
+                        "zooming in kept the fitted raster"
+                    );
+                    assert!(Arc::ptr_eq(
+                        &this.attachment_preview.as_ref().unwrap().image,
+                        &zoom.shown.image
+                    ));
+                });
                 transcript.update(cx, |this, cx| {
                     assert!(this.attachment_preview.is_some());
                     assert!(this.diagram_zoom.is_some());

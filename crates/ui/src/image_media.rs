@@ -27,6 +27,8 @@ pub(crate) struct MediaImage {
 
 const PREVIEW_PIXELS: usize = 1024 * 1024;
 const MAX_RASTER_SIDE: f64 = 4096.0;
+/// Most pixels a lightbox raster may hold once it follows the viewer's zoom.
+const ZOOM_PIXELS: usize = 4 * PREVIEW_PIXELS;
 // GPUI's SvgRenderer rasterizes SVG images at twice their declared dimensions.
 const GPUI_SVG_SCALE: f64 = 2.0;
 
@@ -46,6 +48,12 @@ fn raster_size(
         .min(MAX_RASTER_SIDE / w)
         .min(MAX_RASTER_SIDE / h)
         .min((pixels.max(1) as f64 / (w * h)).sqrt());
+    scaled_size(w, h, scale, pixels)
+}
+
+/// Whole-pixel raster dimensions at `scale`, held inside the pixel budget
+/// even when a one-pixel minimum side would exceed it.
+fn scaled_size(w: f64, h: f64, scale: f64, pixels: usize) -> (u32, u32) {
     let mut size = (
         (w * scale).floor().max(1.0) as u32,
         (h * scale).floor().max(1.0) as u32,
@@ -69,10 +77,14 @@ fn svg_retained_bytes(svg: &str, raster: (u32, u32)) -> usize {
 impl MediaImage {
     /// Preserve the sanitized vector source; only the outer raster viewport changes.
     pub(crate) fn for_view(&self, viewport: (f32, f32), dpi: f32, pixels: usize) -> Self {
+        let size = raster_size(self.width, self.height, viewport, dpi, pixels);
+        self.with_raster(size)
+    }
+
+    fn with_raster(&self, size: (u32, u32)) -> Self {
         let Some(svg) = &self.svg else {
             return self.clone();
         };
-        let size = raster_size(self.width, self.height, viewport, dpi, pixels);
         if self.raster_size == Some(size) {
             return self.clone();
         }
@@ -109,6 +121,33 @@ impl MediaImage {
 
     pub(crate) fn preview_for_view(&self, viewport: (f32, f32), dpi: f32) -> Self {
         self.for_view(viewport, dpi, PREVIEW_PIXELS)
+    }
+
+    /// Width in device pixels of the raster a prepared SVG currently holds.
+    pub(crate) fn raster_width(&self) -> Option<u32> {
+        self.raster_size.map(|(width, _)| width)
+    }
+
+    /// The raster a lightbox needs to draw this SVG at `zoom` times its
+    /// natural size. A viewer scales one texture, so a raster made for the
+    /// fitted view turns soft as soon as it is magnified; this one follows
+    /// the zoom instead, as far as `available` memory and the raster limits
+    /// allow. `None` for media with no vector source to redraw.
+    pub(crate) fn zoomed(&self, zoom: f32, dpi: f32, available: usize) -> Option<Self> {
+        let svg = self.svg.as_ref()?;
+        if !zoom.is_finite() || zoom <= 0.0 {
+            return None;
+        }
+        let pixels = (available.saturating_sub(svg.len() * 2 + 1024) / 8).min(ZOOM_PIXELS);
+        if pixels == 0 {
+            return None;
+        }
+        let (w, h) = (f64::from(self.width), f64::from(self.height));
+        let scale = (f64::from(zoom) * f64::from(dpi.clamp(1.0, 4.0)))
+            .min(MAX_RASTER_SIDE / w)
+            .min(MAX_RASTER_SIDE / h)
+            .min((pixels as f64 / (w * h)).sqrt());
+        Some(self.with_raster(scaled_size(w, h, scale, pixels)))
     }
 
     pub(crate) fn enlarged(
@@ -421,6 +460,42 @@ mod tests {
         // A smaller raster frees memory and is always taken.
         let smaller = sharper.preview_within((100.0, 50.0), 1.0, 0);
         assert!(smaller.bytes < sharper.bytes);
+    }
+
+    #[test]
+    fn lightbox_rasters_follow_the_zoom_within_their_limits() {
+        let media = decode_image(
+            "image/svg+xml",
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="800" height="1600"><rect width="800" height="1600"/></svg>"#.to_vec(),
+        )
+        .unwrap();
+        let size = |zoom: f32, dpi: f32, available: usize| {
+            media
+                .zoomed(zoom, dpi, available)
+                .and_then(|m| m.raster_size)
+        };
+        // A fitted view needs few pixels; magnifying asks for more, where the
+        // fitted raster would only be stretched.
+        assert_eq!(size(0.4, 1.0, usize::MAX), Some((320, 640)));
+        assert_eq!(size(1.0, 1.0, usize::MAX), Some((800, 1600)));
+        assert_eq!(size(1.0, 1.5, usize::MAX), Some((1200, 2400)));
+        // Past the pixel and side limits the raster stops growing.
+        let (w, h) = size(8.0, 2.0, usize::MAX).unwrap();
+        assert!(w as usize * h as usize <= ZOOM_PIXELS);
+        assert!(f64::from(h) <= MAX_RASTER_SIDE);
+        assert!(w > 1200, "the limit still leaves room past the fitted view");
+        // The owner's remaining memory bounds it too.
+        let (w, h) = size(8.0, 2.0, 1024 * 1024).unwrap();
+        assert!(w as usize * h as usize * 8 <= 1024 * 1024);
+        assert!(size(1.0, 1.0, 0).is_none());
+        assert!(size(f32::NAN, 1.0, usize::MAX).is_none());
+        // Raster images have no vector source to redraw.
+        let mut png = Vec::new();
+        image::RgbaImage::new(4, 4)
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let raster = decode_image("image/png", png).unwrap();
+        assert!(raster.zoomed(2.0, 1.0, usize::MAX).is_none());
     }
 
     #[test]

@@ -1159,6 +1159,7 @@ impl MarkdownPreview {
                                     cx.notify();
                                 });
                             }),
+                            enlarge: None,
                         })
                     })),
                     image: Some(Rc::new(move |image, id, theme| {

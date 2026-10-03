@@ -194,6 +194,23 @@ impl ImageView {
         self.0.borrow().geometry.scale
     }
 
+    #[cfg(test)]
+    pub fn test_zoom(&self, scale: f32) {
+        let mut state = self.0.borrow_mut();
+        let center = point(
+            state.geometry.viewport.width / 2.0,
+            state.geometry.viewport.height / 2.0,
+        );
+        state.geometry.zoom(scale, center);
+    }
+
+    /// Displayed size over natural size, once the viewport has been measured.
+    pub fn scale(&self) -> Option<f32> {
+        let state = self.0.borrow();
+        (state.bounds.size.width > px(0.0) && state.bounds.size.height > px(0.0))
+            .then_some(state.geometry.scale)
+    }
+
     pub fn dragged(&self) -> bool {
         self.0.borrow().dragged
     }
