@@ -1163,7 +1163,7 @@ impl MarkdownPreview {
                         })
                     })),
                     image: Some(Rc::new(move |image, id, theme| {
-                        match images.get(&image.source) {
+                        Some(match images.get(&image.source) {
                             Some(Ok(loaded)) => {
                                 let mut el = div().flex().flex_col().gap(px(4.0)).child(
                                     Self::media_element(
@@ -1243,7 +1243,7 @@ impl MarkdownPreview {
                                     })
                                     .into_any_element()
                             }
-                        }
+                        })
                     })),
                 });
                 opts.link = Some(link.clone());
