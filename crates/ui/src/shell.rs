@@ -693,6 +693,17 @@ fn right_pane_takeover_width(viewport: f32, sidebar: f32) -> f32 {
     (viewport - sidebar).max(0.0)
 }
 
+/// What a new Browser tab shows first.
+enum BrowserStart {
+    Empty,
+    Url(String),
+    /// A workspace HTML file rendered from its text.
+    Document {
+        path: String,
+        html: String,
+    },
+}
+
 /// One right-pane surface tab: a workspace browser, an individual workspace
 /// file editor, a Git diff or history page, an embedded terminal, or a
 /// subagent transcript. `Picker` is the empty surface chooser.
@@ -2713,19 +2724,14 @@ impl Shell {
                                 .attention_sound_gate
                                 .should_play(std::time::Instant::now());
                         if should_play {
-                            crate::sound::play(sound);
+                            crate::sound::play(sound, self.settings.custom_sounds.get(sound));
                         }
                     }
                     if self.settings.notifications_enabled
                         && !(self.settings.notifications_background_only && app_focused)
                     {
                         let title = title.unwrap_or_else(|| "New session".into());
-                        let body = match sound {
-                            crate::sound::Sound::Done => "Run finished",
-                            crate::sound::Sound::Request => "Waiting on your input",
-                            crate::sound::Sound::Attention => "Run failed",
-                        };
-                        crate::notify::post(&title, body, Some(&chat_id));
+                        crate::notify::post(&title, sound.banner_body(), Some(&chat_id));
                     }
                 }
             }
@@ -2739,7 +2745,7 @@ impl Shell {
                         .attention_sound_gate
                         .should_play(std::time::Instant::now())
                 {
-                    crate::sound::play(sound);
+                    crate::sound::play(sound, self.settings.custom_sounds.get(sound));
                 }
                 if self.settings.notifications_enabled
                     && !(self.settings.notifications_background_only && app_focused)
@@ -3523,6 +3529,57 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let start = url.map_or(BrowserStart::Empty, BrowserStart::Url);
+        self.add_browser_surface_with(start, window, cx);
+    }
+
+    /// Render a workspace HTML file in a Browser tab. Previewing the same
+    /// file again refreshes its tab instead of opening another.
+    fn open_html_preview(
+        &mut self,
+        path: String,
+        html: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_chat.is_empty() {
+            return;
+        }
+        self.set_surfaces_open(true, cx);
+        let key = self.panel_key(cx);
+        let existing = self
+            .right_tabs
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .find_map(|surface| match surface {
+                RightSurface::Browser(id)
+                    if self.browsers.get(id).is_some_and(|browser| {
+                        browser.read(cx).document_path() == Some(path.as_str())
+                    }) =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            });
+        let Some(id) = existing else {
+            self.add_browser_surface_with(BrowserStart::Document { path, html }, window, cx);
+            return;
+        };
+        self.set_right_active(RightSurface::Browser(id), cx);
+        if let Some(browser) = self.browsers.get(&id).cloned() {
+            browser.update(cx, |browser, cx| {
+                browser.open_document(path, html, window, cx)
+            });
+        }
+    }
+
+    fn add_browser_surface_with(
+        &mut self,
+        start: BrowserStart,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.active_chat.is_empty() {
             return;
         }
@@ -3568,12 +3625,10 @@ impl Shell {
             .or_default()
             .push(RightSurface::Browser(id));
         self.set_right_active(RightSurface::Browser(id), cx);
-        browser.update(cx, |browser, cx| {
-            if let Some(url) = url {
-                browser.navigate(&url, window, cx);
-            } else {
-                browser.focus_address(window, cx);
-            }
+        browser.update(cx, |browser, cx| match start {
+            BrowserStart::Url(url) => browser.navigate(&url, window, cx),
+            BrowserStart::Document { path, html } => browser.open_document(path, html, window, cx),
+            BrowserStart::Empty => browser.focus_address(window, cx),
         });
     }
 
@@ -3706,6 +3761,9 @@ impl Shell {
                         {
                             cx.open_url(&url);
                         }
+                    }
+                    FilesEvent::PreviewHtml { path, html } => {
+                        this.open_html_preview(path.clone(), html.clone(), window, cx)
                     }
                     FilesEvent::TitleChanged => cx.notify(),
                     FilesEvent::FileRenamed { old_path, new_path } => {
@@ -4920,6 +4978,7 @@ impl Shell {
                             self.settings.sound_completion_enabled,
                             self.settings.sound_input_enabled,
                             self.settings.sound_attention_enabled,
+                            self.settings.custom_sounds.clone(),
                             self.settings.notifications_enabled,
                             self.settings.notifications_background_only,
                             self.settings.agent_update_notifications,
@@ -4935,14 +4994,16 @@ impl Shell {
                                 completion_sound,
                                 input_sound,
                                 attention_sound,
+                                custom_sounds,
                                 desktop,
                                 background_only,
                                 agent_updates,
-                            } = *event;
+                            } = event.clone();
                             this.settings.sound_enabled = sound;
                             this.settings.sound_completion_enabled = completion_sound;
                             this.settings.sound_input_enabled = input_sound;
                             this.settings.sound_attention_enabled = attention_sound;
+                            this.settings.custom_sounds = custom_sounds;
                             this.settings.notifications_enabled = desktop;
                             this.settings.notifications_background_only = background_only;
                             this.settings.agent_update_notifications = agent_updates;

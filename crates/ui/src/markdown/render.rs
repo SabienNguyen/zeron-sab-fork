@@ -130,6 +130,8 @@ pub struct DiagramUi {
     pub body: AnyElement,
     pub show_source: bool,
     pub toggle_source: Rc<dyn Fn(&mut Window, &mut gpui::App)>,
+    /// Opens the diagram in the lightbox; `None` shows no header action.
+    pub enlarge: Option<Rc<dyn Fn(&mut Window, &mut gpui::App)>>,
 }
 
 /// Copy-button wiring for one row's code blocks: the handler writes the code
@@ -2086,7 +2088,17 @@ fn render_code_block(
                     vec![toggle_action],
                 );
             }
-            let mut actions = vec![toggle_action];
+            let mut actions = Vec::new();
+            if let Some(enlarge) = diagram.enlarge.clone() {
+                actions.push(code_icon_action(
+                    format!("{frame_id}-enlarge").into(),
+                    "Open full screen",
+                    crate::icons::EXPAND_ARROWS,
+                    enlarge,
+                    theme,
+                ));
+            }
+            actions.push(toggle_action);
             actions.extend(code_copy_button(code, ix, opts, theme));
             return code_block_frame(frame_id, language, actions, diagram.body, theme)
                 .into_any_element();

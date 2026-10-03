@@ -226,7 +226,7 @@ impl CodexHarness {
             Ok::<Value, HarnessError>(skills)
         };
         let result = tokio::time::timeout(Duration::from_secs(10), discovery).await;
-        shutdown_child(&mut child, self.kill_grace).await;
+        crate::retire_probe(child, self.kill_grace).await;
         match result {
             Ok(inner) => inner,
             Err(_) => Err(HarnessError::Protocol("command discovery timed out".into())),

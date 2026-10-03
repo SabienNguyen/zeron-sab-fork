@@ -16,6 +16,23 @@ struct ViewState {
     drag: Option<(Point<f32>, Point<f32>)>,
     dragged: bool,
     pinch: Option<(f32, f32)>,
+    /// A mouse wheel zooms without Control held (trackpad scrolling still pans).
+    wheel_zooms: bool,
+}
+
+/// A sharper drawing of one part of the image, painted over it: the part's
+/// `[x, y, w, h]` in natural units.
+pub(crate) type Detail = (Arc<Image>, [f32; 4]);
+
+/// What the viewer currently shows of its image.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Visible {
+    /// Displayed size over natural size.
+    pub scale: f32,
+    /// The on-screen part, `[x, y, w, h]` in natural units.
+    pub rect: [f32; 4],
+    /// Where the image's top-left corner sits in the viewport.
+    pub origin: Point<f32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -147,7 +164,8 @@ impl ViewState {
     }
     fn wheel(&mut self, event: &gpui::ScrollWheelEvent) -> bool {
         let delta = scroll_pixels(event.delta);
-        if event.modifiers.control {
+        let wheel = self.wheel_zooms && matches!(event.delta, ScrollDelta::Lines(_));
+        if event.modifiers.control || wheel {
             let scale = self.geometry.scale * (delta.y * 0.0025).clamp(-2.0, 2.0).exp();
             self.geometry.zoom(scale, self.local(event.position));
             true
@@ -194,12 +212,53 @@ impl ImageView {
         self.0.borrow().geometry.scale
     }
 
+    #[cfg(test)]
+    pub fn test_zoom(&self, scale: f32) {
+        let mut state = self.0.borrow_mut();
+        let center = point(
+            state.geometry.viewport.width / 2.0,
+            state.geometry.viewport.height / 2.0,
+        );
+        state.geometry.zoom(scale, center);
+    }
+
+    /// Let a mouse wheel zoom on its own: for content with nothing to scroll.
+    pub fn zoom_on_wheel(&self) {
+        self.0.borrow_mut().wheel_zooms = true;
+    }
+
+    /// The part of the image on screen, once the viewport has been measured.
+    pub fn visible(&self) -> Option<Visible> {
+        let state = self.0.borrow();
+        if state.bounds.size.width <= px(0.0) || state.bounds.size.height <= px(0.0) {
+            return None;
+        }
+        let geometry = state.geometry;
+        let origin = geometry.image_origin();
+        let scale = geometry.scale;
+        let left = (-origin.x / scale).clamp(0.0, geometry.natural.width);
+        let top = (-origin.y / scale).clamp(0.0, geometry.natural.height);
+        let right =
+            ((geometry.viewport.width - origin.x) / scale).clamp(0.0, geometry.natural.width);
+        let bottom =
+            ((geometry.viewport.height - origin.y) / scale).clamp(0.0, geometry.natural.height);
+        (right > left && bottom > top).then_some(Visible {
+            scale,
+            rect: [left, top, right - left, bottom - top],
+            origin,
+        })
+    }
+
     pub fn dragged(&self) -> bool {
         self.0.borrow().dragged
     }
 
     pub fn reset(&self) {
-        *self.0.borrow_mut() = ViewState::default();
+        let mut state = self.0.borrow_mut();
+        *state = ViewState {
+            wheel_zooms: state.wheel_zooms,
+            ..ViewState::default()
+        };
     }
 
     pub fn render(
@@ -208,6 +267,7 @@ impl ImageView {
         natural: Size<Pixels>,
         on_image_click: Option<ImageClick>,
         plate: Option<gpui::Hsla>,
+        detail: Option<Detail>,
         _window: &mut Window,
         _cx: &mut App,
     ) -> AnyElement {
@@ -305,6 +365,37 @@ impl ImageView {
                     .h(px(natural.height * geometry.scale))
                     .object_fit(gpui::ObjectFit::Contain),
             )
+            .when_some(detail, |viewport, (image, [x, y, w, h])| {
+                // Whole-pixel placement: a sharp raster offset by a fraction
+                // of a pixel is resampled soft again.
+                let left = px((origin.x + x * geometry.scale).round());
+                let top = px((origin.y + y * geometry.scale).round());
+                let width = px((w * geometry.scale).round());
+                let height = px((h * geometry.scale).round());
+                viewport
+                    // Hide the soft image beneath, which a transparent
+                    // drawing would otherwise show through.
+                    .when_some(plate, |viewport, plate| {
+                        viewport.child(
+                            div()
+                                .absolute()
+                                .left(left)
+                                .top(top)
+                                .w(width)
+                                .h(height)
+                                .bg(plate),
+                        )
+                    })
+                    .child(
+                        gpui::img(image)
+                            .absolute()
+                            .left(left)
+                            .top(top)
+                            .w(width)
+                            .h(height)
+                            .object_fit(gpui::ObjectFit::Fill),
+                    )
+            })
             .child(
                 gpui::canvas(
                     move |bounds, window, cx| {
@@ -426,6 +517,17 @@ mod tests {
             (state.geometry.scale - 0.5).abs() < 0.0001,
             "wheel down reverses zoom"
         );
+        // Content with nothing to scroll zooms on a bare mouse wheel, while
+        // trackpad scrolling keeps panning.
+        event.modifiers.control = false;
+        state.wheel_zooms = true;
+        event.delta = ScrollDelta::Lines(point(0.0, 1.0));
+        assert!(state.wheel(&event));
+        assert!(state.geometry.scale > 0.5);
+        let zoomed = state.geometry.scale;
+        event.delta = ScrollDelta::Pixels(point(px(0.0), px(40.0)));
+        state.wheel(&event);
+        assert_eq!(state.geometry.scale, zoomed);
     }
     #[test]
     fn pinch_accumulates_native_deltas_and_a_drag_does_not_click() {

@@ -3061,6 +3061,64 @@ impl SavedViewportCache {
     }
 }
 
+/// Whether a drawn detail still covers what is on screen at the zoom's density.
+fn detail_serves(
+    detail: &crate::image_media::MediaRegion,
+    view: &crate::image_viewer::Visible,
+    need: f32,
+) -> bool {
+    let [x, y, w, h] = detail.rect;
+    let [vx, vy, vw, vh] = view.rect;
+    // Half a screen pixel of slack, in natural units.
+    let slack = 0.5 / view.scale;
+    let covers =
+        x <= vx + slack && y <= vy + slack && x + w >= vx + vw - slack && y + h >= vy + vh - slack;
+    covers && (detail.density / need - 1.0).abs() <= 0.02
+}
+
+/// The part of a diagram to draw for a view: what is on screen plus a margin,
+/// inside the diagram, with edges on whole screen pixels so the raster maps
+/// onto the display one to one.
+fn detail_rect(
+    view: &crate::image_viewer::Visible,
+    margin: f32,
+    dpi: f32,
+    source: &crate::image_media::MediaImage,
+) -> [f32; 4] {
+    let [x, y, w, h] = view.rect;
+    let step = view.scale * dpi;
+    // Device-pixel offsets from the diagram's own corner.
+    let edge = |value: f32, limit: f32, up: bool| {
+        let pixels = value.clamp(0.0, limit) * step;
+        (if up { pixels.ceil() } else { pixels.floor() } / step).min(limit)
+    };
+    let left = edge(x - w * margin, source.width, false);
+    let top = edge(y - h * margin, source.height, false);
+    let right = edge(x + w * (1.0 + margin), source.width, true);
+    let bottom = edge(y + h * (1.0 + margin), source.height, true);
+    [left, top, right - left, bottom - top]
+}
+
+/// The lightbox draws the on-screen part of a diagram on its own once the
+/// fitted raster is this far short of the zoom.
+const DIAGRAM_DETAIL_FROM: f32 = 1.05;
+/// Extra diagram drawn around the on-screen part, as a share of it, so a
+/// short pan stays sharp.
+const DIAGRAM_DETAIL_MARGIN: f32 = 0.25;
+
+/// A diagram open in the lightbox.
+struct DiagramZoom {
+    /// The row's prepared diagram; owned by the diagram cache.
+    source: crate::image_media::MediaImage,
+    /// The whole diagram at the fitted size, shown while zoomed out and
+    /// beneath the detail while it catches up.
+    shown: crate::image_media::MediaImage,
+    /// The on-screen part drawn for the current zoom, painted over `shown`.
+    detail: Option<crate::image_media::MediaRegion>,
+    /// A newer detail, still decoding.
+    pending: Option<crate::image_media::MediaRegion>,
+}
+
 pub struct Transcript {
     state: Entity<AppState>,
     list: ListState,
@@ -3275,9 +3333,9 @@ pub struct Transcript {
     diagram_media: Option<render::MediaUi>,
     /// The single serialized diagram render loop, while requests remain.
     diagram_worker: Option<Task<()>>,
-    /// Prepared diagram shown in the lightbox: its natural size frames the
-    /// enlarged raster, which is released when the lightbox closes.
-    diagram_zoom: Option<crate::image_media::MediaImage>,
+    /// Diagram shown in the lightbox: its natural size frames the enlarged
+    /// raster, which follows the viewer's zoom and is released on close.
+    diagram_zoom: Option<DiagramZoom>,
     /// Images drawn inline in settled Markdown blocks: the same lazy cache
     /// as `diagrams`, keyed by [`chat_images::ImageRead::key`] instead of a
     /// fence's source.
@@ -5894,9 +5952,15 @@ impl Transcript {
                             )
                         };
                         let toggle = owner.clone();
+                        let enlarge = owner.clone();
                         render::DiagramView::Diagram(render::DiagramUi {
                             body,
                             show_source,
+                            enlarge: Some(Rc::new(move |window, cx| {
+                                let _ = enlarge.update(cx, |this, cx| {
+                                    this.open_diagram_preview(media.clone(), window, cx)
+                                });
+                            })),
                             toggle_source: Rc::new(move |_, cx| {
                                 let _ = toggle.update(cx, |this, cx| {
                                     this.diagrams.borrow_mut().toggle_source(&id);
@@ -6141,7 +6205,8 @@ impl Transcript {
             .saturating_sub(self.diagrams.borrow().retained_bytes());
         let preview =
             crate::attachments::PreviewImage::new("Mermaid diagram", source.image.clone())
-                .with_plate(crate::markdown::mermaid::Palette::plate(Theme::of(cx)));
+                .with_plate(crate::markdown::mermaid::Palette::plate(Theme::of(cx)))
+                .with_wheel_zoom();
         self.open_media_preview(source, preview, available, window, cx);
     }
 
@@ -6167,23 +6232,104 @@ impl Transcript {
             None,
         );
         self.attachment_preview_return_focus = window.focused(cx);
-        preview.image = enlarged.image;
+        preview.image = enlarged.image.clone();
         self.attachment_preview = Some(preview);
-        self.diagram_zoom = Some(source);
+        self.diagram_zoom = Some(DiagramZoom {
+            source,
+            shown: enlarged,
+            detail: None,
+            pending: None,
+        });
         window.focus(&self.attachment_preview_focus, cx);
         cx.notify();
     }
 
-    /// Release a media lightbox's dedicated raster. The row's own preview
-    /// stays with its cache.
-    fn close_diagram_zoom(&mut self, cx: &mut gpui::App) {
-        let Some(source) = self.diagram_zoom.take() else {
+    /// Keep the diagram lightbox sharp at any zoom. The viewer only scales
+    /// the texture it is given, so the fitted raster blurs once magnified,
+    /// and a large diagram cannot be held whole at reading resolution.
+    /// Instead the part on screen is redrawn from the vector source at the
+    /// current zoom and painted over the fitted raster. One detail decodes
+    /// at a time and replaces the last only once ready, so nothing blanks.
+    fn refine_diagram_zoom(&mut self, window: &mut Window, cx: &mut gpui::App) {
+        let available = mermaid_cache::MAX_RETAINED_BYTES
+            .saturating_sub(self.diagrams.borrow().retained_bytes());
+        let (Some(zoom), Some(preview)) = (&mut self.diagram_zoom, &mut self.attachment_preview)
+        else {
             return;
         };
-        if let Some(preview) = self.attachment_preview.take()
-            && !Arc::ptr_eq(&preview.image, &source.image)
-        {
-            cx.defer(move |cx| gpui::ImageSource::Image(preview.image).evict(None, cx));
+        let mut retired = Vec::new();
+        if let Some(next) = zoom.pending.take() {
+            if next.image.clone().use_render_image(window, cx).is_none() {
+                zoom.pending = Some(next);
+            } else {
+                retired.extend(zoom.detail.replace(next).map(|old| old.image));
+            }
+        }
+        if let Some(view) = preview.viewer.visible() {
+            let need = view.scale * window.scale_factor();
+            let fitted = zoom
+                .shown
+                .raster_width()
+                .map_or(f32::MAX, |width| width as f32 / zoom.source.width);
+            if need <= fitted * DIAGRAM_DETAIL_FROM {
+                // Zoomed out: the fitted raster already has every pixel shown.
+                retired.extend(zoom.detail.take().map(|old| old.image));
+                retired.extend(zoom.pending.take().map(|old| old.image));
+            } else if zoom.pending.is_none()
+                && !zoom
+                    .detail
+                    .as_ref()
+                    .is_some_and(|detail| detail_serves(detail, &view, need))
+            {
+                let dpi = window.scale_factor();
+                let wanted = [DIAGRAM_DETAIL_MARGIN, 0.0].into_iter().find_map(|margin| {
+                    let rect = detail_rect(&view, margin, dpi, &zoom.source);
+                    zoom.source
+                        .region(rect, need, available)
+                        // Budget-limited: try again without the margin.
+                        .filter(|region| margin == 0.0 || region.density >= need * 0.98)
+                });
+                if let Some(wanted) = wanted {
+                    // Starts the decode; this view repaints when it lands.
+                    let _ = wanted.image.clone().use_render_image(window, cx);
+                    zoom.pending = Some(wanted);
+                }
+            }
+        }
+        preview.detail = zoom
+            .detail
+            .as_ref()
+            .map(|detail| (detail.image.clone(), detail.rect));
+        if !retired.is_empty() {
+            cx.defer(move |cx| {
+                for image in retired {
+                    gpui::ImageSource::Image(image).evict(None, cx);
+                }
+            });
+        }
+    }
+
+    /// Release a media lightbox's dedicated rasters. The row's own preview
+    /// stays with its cache.
+    fn close_diagram_zoom(&mut self, cx: &mut gpui::App) {
+        let Some(zoom) = self.diagram_zoom.take() else {
+            return;
+        };
+        let retired = self
+            .attachment_preview
+            .take()
+            .map(|preview| preview.image)
+            .into_iter()
+            .filter(|image| !Arc::ptr_eq(image, &zoom.source.image))
+            .chain(zoom.detail.map(|detail| detail.image))
+            .chain(zoom.pending.map(|pending| pending.image))
+            .collect::<Vec<_>>();
+        if !retired.is_empty() {
+            cx.defer(move |cx| {
+                for image in retired {
+                    gpui::ImageSource::Image(image).evict(None, cx);
+                }
+            });
         }
     }
 
@@ -9445,13 +9591,14 @@ impl Render for Transcript {
             .child(rail);
         // Full-size viewer for a clicked user-bubble thumbnail
         // (AttachmentPreviewDialog: bare lightbox, click closes).
+        self.refine_diagram_zoom(window, cx);
         if let Some(preview) = self.attachment_preview.clone() {
             let weak = cx.weak_entity();
             // A diagram's enlarged raster is framed by its natural size.
             let natural_size = self
                 .diagram_zoom
                 .as_ref()
-                .map(|source| size(px(source.width), px(source.height)));
+                .map(|zoom| size(px(zoom.source.width), px(zoom.source.height)));
             return root.child(crate::attachments::lightbox_with_size(
                 window,
                 &preview,
@@ -13738,6 +13885,73 @@ mod tests {
                 })
                 .unwrap();
                 draw(window, cx);
+                // Fitted, the whole-diagram raster is enough.
+                transcript.update(cx, |this, _| {
+                    let zoom = this.diagram_zoom.as_ref().unwrap();
+                    assert!(zoom.detail.is_none() && zoom.pending.is_none());
+                });
+                // Magnified, the part on screen is redrawn for the zoom and
+                // painted over the fitted raster once decoded, instead of
+                // that raster being stretched.
+                let repaint_until = |done: &dyn Fn(&Transcript) -> bool, cx: &mut gpui::App| {
+                    // The decode runs on a background thread.
+                    for _ in 0..500 {
+                        transcript.update(cx, |_, cx| cx.notify());
+                        draw(window, cx);
+                        if done(transcript.read(cx)) {
+                            return true;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    false
+                };
+                transcript.update(cx, |this, _| {
+                    this.attachment_preview
+                        .as_ref()
+                        .expect("lightbox")
+                        .viewer
+                        .test_zoom(6.0);
+                });
+                let sharp = |this: &Transcript| {
+                    let zoom = this.diagram_zoom.as_ref().unwrap();
+                    let preview = this.attachment_preview.as_ref().unwrap();
+                    let Some(view) = preview.viewer.visible() else {
+                        return false;
+                    };
+                    zoom.pending.is_none()
+                        && zoom
+                            .detail
+                            .as_ref()
+                            .is_some_and(|detail| detail_serves(detail, &view, view.scale))
+                        && preview.detail.is_some()
+                };
+                assert!(repaint_until(&sharp, cx), "the zoomed detail never landed");
+                transcript.update(cx, |this, _| {
+                    let zoom = this.diagram_zoom.as_ref().unwrap();
+                    let detail = zoom.detail.as_ref().unwrap();
+                    let view = this.attachment_preview.as_ref().unwrap().viewer.visible();
+                    let view = view.unwrap();
+                    assert!((detail.density - view.scale).abs() < 0.05);
+                    // Only about what is on screen, not the whole diagram.
+                    assert!(
+                        detail.rect[2] * detail.rect[3] < zoom.source.width * zoom.source.height
+                    );
+                });
+                // Back at the fitted size the detail is released.
+                transcript.update(cx, |this, _| {
+                    this.attachment_preview
+                        .as_ref()
+                        .unwrap()
+                        .viewer
+                        .test_zoom(0.01);
+                });
+                let released = |this: &Transcript| {
+                    let zoom = this.diagram_zoom.as_ref().unwrap();
+                    zoom.detail.is_none()
+                        && zoom.pending.is_none()
+                        && this.attachment_preview.as_ref().unwrap().detail.is_none()
+                };
+                assert!(repaint_until(&released, cx), "the detail outlived the zoom");
                 transcript.update(cx, |this, cx| {
                     assert!(this.attachment_preview.is_some());
                     assert!(this.diagram_zoom.is_some());

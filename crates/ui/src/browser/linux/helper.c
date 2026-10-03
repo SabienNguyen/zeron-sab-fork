@@ -11,6 +11,7 @@
 
 #define MAX_COMMAND (1024 * 1024)
 #define MAX_DIMENSION 8192
+#define MAX_HTML (32 * 1024 * 1024)
 
 typedef struct {
     guint id;
@@ -22,6 +23,9 @@ typedef struct {
     double scale;
     WebKitOptionMenu *options;
     gchar *context_link;
+    // A workspace document is loaded from text and commits as about:blank.
+    GString *html;
+    gboolean local;
 } Page;
 static GHashTable *pages;
 static WebKitWebContext *context;
@@ -198,6 +202,9 @@ static gboolean policy(WebKitWebView *web, WebKitPolicyDecision *decision,
         WebKitNavigationAction *action = webkit_navigation_policy_decision_get_navigation_action(
             WEBKIT_NAVIGATION_POLICY_DECISION(decision));
         const char *uri = webkit_uri_request_get_uri(webkit_navigation_action_get_request(action));
+        if (type == WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION && p->local &&
+            !g_strcmp0(uri, "about:blank"))
+            return FALSE;
         if (!allowed(uri)) {
             webkit_policy_decision_ignore(decision);
             return TRUE;
@@ -297,6 +304,8 @@ static void free_page(gpointer data) {
     gtk_widget_destroy(p->window);
     g_free(p->error);
     g_free(p->context_link);
+    if (p->html)
+        g_string_free(p->html, TRUE);
     g_free(p);
 }
 static Page *new_page(guint id) {
@@ -487,8 +496,22 @@ static void command(JsonObject *o) {
     }
     if (!strcmp(cmd, "load")) {
         const char *url = string(o, "url");
-        if (allowed(url))
+        if (allowed(url)) {
+            p->local = FALSE;
             webkit_web_view_load_uri(p->web, url);
+        }
+    } else if (!strcmp(cmd, "html")) {
+        // One command is bounded by MAX_COMMAND; a document arrives in chunks.
+        const char *data = string(o, "data");
+        if (!p->html)
+            p->html = g_string_new(NULL);
+        if (p->html->len + strlen(data) <= MAX_HTML)
+            g_string_append(p->html, data);
+    } else if (!strcmp(cmd, "load-html")) {
+        p->local = TRUE;
+        webkit_web_view_load_html(p->web, p->html ? p->html->str : "", NULL);
+        if (p->html)
+            g_string_truncate(p->html, 0);
     } else if (!strcmp(cmd, "dismiss-menu")) {
         if (p->options) {
             webkit_option_menu_close(p->options);

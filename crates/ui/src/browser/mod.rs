@@ -80,6 +80,8 @@ pub struct BrowserSurface {
     address: Entity<ComposerInput>,
     focus: FocusHandle,
     pub page: PageState,
+    /// Set while this tab shows a workspace file rather than a web address.
+    document: Option<model::LocalDocument>,
     pub favicon: Option<std::sync::Arc<gpui::Image>>,
     address_edited: bool,
     validation: Option<String>,
@@ -158,6 +160,7 @@ impl BrowserSurface {
             address,
             focus: cx.focus_handle(),
             page: PageState::default(),
+            document: None,
             favicon: None,
             address_edited: false,
             validation: None,
@@ -324,6 +327,7 @@ impl BrowserSurface {
             }
         };
         self.validation = None;
+        self.document = None;
         self.address
             .update(cx, |input, cx| input.set_text(url.clone(), cx));
         self.address_edited = false;
@@ -338,16 +342,7 @@ impl BrowserSurface {
                 self.favicon_generation += 1;
                 self.favicon_task = None;
             }
-            let result = if let Some(native) = &self.native {
-                native.load(&url)
-            } else {
-                native::NativePage::new(window, &self.context.data, self.native_tx.clone())
-                    .map(|mut native| {
-                        native.present(self.presentation);
-                        self.native = Some(native);
-                    })
-                    .and_then(|_| self.native.as_ref().unwrap().load(&url))
-            };
+            let result = self.load_native(window, |native| native.load(&url));
             self.page.loading = result.is_ok();
             if let Err(error) = result {
                 self.page.error = Some(format!("Could not open this page: {error}"));
@@ -363,6 +358,75 @@ impl BrowserSurface {
         cx.notify();
     }
 
+    /// Render a workspace file from its text. The page never receives a file
+    /// address, so navigation stays limited to web links the document follows.
+    pub fn open_document(
+        &mut self,
+        path: String,
+        html: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let document = model::LocalDocument { path, html };
+        self.validation = None;
+        self.address
+            .update(cx, |input, cx| input.set_text(document.path.clone(), cx));
+        self.address_edited = false;
+        self.page = PageState {
+            url: Some(document.path.clone()),
+            title: document.name().to_owned(),
+            ..PageState::default()
+        };
+        self.clear_favicon(cx);
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            #[cfg(target_os = "macos")]
+            {
+                self.favicon_generation += 1;
+                self.favicon_task = None;
+            }
+            let result = self.load_native(window, |native| native.load_html(&document.html));
+            self.page.loading = result.is_ok();
+            if let Err(error) = result {
+                self.page.error = Some(format!("Could not preview this file: {error}"));
+            }
+            window.focus(&self.focus, cx);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = window;
+            self.page.error = Some("HTML preview is not available on this platform.".into());
+        }
+        self.document = Some(document);
+        cx.emit(BrowserEvent::Changed);
+        cx.notify();
+    }
+
+    /// The workspace file this tab is currently showing, if it has not
+    /// navigated away from it.
+    pub fn document_path(&self) -> Option<&str> {
+        self.document
+            .as_ref()
+            .map(|document| document.path.as_str())
+            .filter(|path| self.page.url.as_deref() == Some(*path))
+    }
+
+    /// The native page is allocated by the first load, not by an empty tab.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn load_native(
+        &mut self,
+        window: &mut Window,
+        load: impl FnOnce(&native::NativePage) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if self.native.is_none() {
+            let mut native =
+                native::NativePage::new(window, &self.context.data, self.native_tx.clone())?;
+            native.present(self.presentation);
+            self.native = Some(native);
+        }
+        load(self.native.as_ref().unwrap())
+    }
+
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let url = self.address.read(cx).text().to_owned();
         self.navigate(&url, window, cx);
@@ -371,7 +435,14 @@ impl BrowserSurface {
     fn reload(&mut self, cx: &mut Context<Self>) {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         if let Some(native) = &self.native {
-            if self.page.error.is_some() {
+            // The engine holds a document's text only as a blank address.
+            if let Some(document) = self
+                .document
+                .as_ref()
+                .filter(|document| self.page.url.as_deref() == Some(document.path.as_str()))
+            {
+                let _ = native.load_html(&document.html);
+            } else if self.page.error.is_some() {
                 if let Some(url) = &self.page.url {
                     let _ = native.load(url);
                 }
@@ -453,6 +524,9 @@ impl BrowserSurface {
                 if page.url.is_none() {
                     page.url = self.page.url.clone();
                 }
+                if let Some(document) = &self.document {
+                    document.describe(&mut page);
+                }
                 if page.error.is_some() {
                     page.loading = false;
                 }
@@ -473,7 +547,10 @@ impl BrowserSurface {
                     self.address_edited = false;
                 }
                 native.present(self.presentation);
-                if finished && let Some(url) = &page.url {
+                if finished
+                    && let Some(url) = &page.url
+                    && model::allowed_navigation(url)
+                {
                     native.discover_favicon(url.clone());
                 }
                 if page != self.page {
@@ -686,6 +763,42 @@ mod tests {
                 window.blur();
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn address_arrows_move_the_caret(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            crate::composer::init(cx, Default::default());
+            cx.set_global(crate::theme::Theme::default());
+            bind_keys(cx, &crate::settings::KeymapConfig::default());
+        });
+        let window = cx.add_window(|window, cx| {
+            BrowserSurface::new(BrowserContext::default(), false, window, cx)
+        });
+        window
+            .update(cx, |browser, window, cx| {
+                browser
+                    .address
+                    .update(cx, |input, cx| input.set_text("localhost:3000", cx));
+                window.focus(&browser.address.focus_handle(cx), cx);
+            })
+            .unwrap();
+        for (keys, expected) in [
+            ("up", 0),
+            ("right right", 2),
+            ("left", 1),
+            ("down", "localhost:3000".len()),
+        ] {
+            cx.simulate_keystrokes(window.into(), keys);
+            window
+                .update(cx, |browser, window, cx| {
+                    assert_eq!(browser.address.read(cx).cursor_offset(), expected, "{keys}");
+                    assert!(browser.address.focus_handle(cx).is_focused(window));
+                })
+                .unwrap();
+        }
+        window.update(cx, |_, window, _| window.blur()).unwrap();
     }
 
     #[gpui::test]

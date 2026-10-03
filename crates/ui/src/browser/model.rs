@@ -57,6 +57,32 @@ impl PageState {
     }
 }
 
+/// A workspace file rendered from its text. It has no web address: the engine
+/// commits it as `about:blank`, and the chrome shows its path instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalDocument {
+    pub path: String,
+    pub html: String,
+}
+
+impl LocalDocument {
+    pub const ENGINE_URL: &str = "about:blank";
+
+    pub fn name(&self) -> &str {
+        self.path.rsplit('/').next().unwrap_or(&self.path)
+    }
+
+    /// Following a link leaves the document; only its own page is relabelled.
+    pub fn describe(&self, page: &mut PageState) {
+        if page.url.as_deref() == Some(Self::ENGINE_URL) {
+            page.url = Some(self.path.clone());
+        }
+        if page.url.as_deref() == Some(&self.path) && page.title.trim().is_empty() {
+            page.title = self.name().to_owned();
+        }
+    }
+}
+
 pub fn loopback(url: &url::Url) -> bool {
     match url.host() {
         Some(url::Host::Domain(host)) => host == "localhost" || host.ends_with(".localhost"),
@@ -191,6 +217,33 @@ mod tests {
         }
         assert!(!allowed_navigation("javascript:alert(1)"));
         assert!(!allowed_navigation("https://user@example.com/"));
+    }
+    #[test]
+    fn local_documents_show_their_path_until_the_page_navigates_away() {
+        let document = LocalDocument {
+            path: "docs/report.html".into(),
+            html: String::new(),
+        };
+        let mut page = PageState {
+            url: Some(LocalDocument::ENGINE_URL.into()),
+            ..Default::default()
+        };
+        document.describe(&mut page);
+        assert_eq!(page.url.as_deref(), Some("docs/report.html"));
+        assert_eq!(page.label(), "report.html");
+        page.title = "Quarterly report".into();
+        document.describe(&mut page);
+        assert_eq!(page.label(), "Quarterly report");
+
+        let mut elsewhere = PageState {
+            url: Some("https://example.com/".into()),
+            ..Default::default()
+        };
+        document.describe(&mut elsewhere);
+        assert_eq!(elsewhere.url.as_deref(), Some("https://example.com/"));
+        assert!(elsewhere.title.is_empty());
+        // The document's path is never a navigable address.
+        assert!(!allowed_navigation(&document.path));
     }
     #[test]
     fn native_visibility_never_outlives_its_surface() {
