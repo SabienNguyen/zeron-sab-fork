@@ -693,6 +693,17 @@ fn right_pane_takeover_width(viewport: f32, sidebar: f32) -> f32 {
     (viewport - sidebar).max(0.0)
 }
 
+/// What a new Browser tab shows first.
+enum BrowserStart {
+    Empty,
+    Url(String),
+    /// A workspace HTML file rendered from its text.
+    Document {
+        path: String,
+        html: String,
+    },
+}
+
 /// One right-pane surface tab: a workspace browser, an individual workspace
 /// file editor, a Git diff or history page, an embedded terminal, or a
 /// subagent transcript. `Picker` is the empty surface chooser.
@@ -3523,6 +3534,57 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let start = url.map_or(BrowserStart::Empty, BrowserStart::Url);
+        self.add_browser_surface_with(start, window, cx);
+    }
+
+    /// Render a workspace HTML file in a Browser tab. Previewing the same
+    /// file again refreshes its tab instead of opening another.
+    fn open_html_preview(
+        &mut self,
+        path: String,
+        html: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_chat.is_empty() {
+            return;
+        }
+        self.set_surfaces_open(true, cx);
+        let key = self.panel_key(cx);
+        let existing = self
+            .right_tabs
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .find_map(|surface| match surface {
+                RightSurface::Browser(id)
+                    if self.browsers.get(id).is_some_and(|browser| {
+                        browser.read(cx).document_path() == Some(path.as_str())
+                    }) =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            });
+        let Some(id) = existing else {
+            self.add_browser_surface_with(BrowserStart::Document { path, html }, window, cx);
+            return;
+        };
+        self.set_right_active(RightSurface::Browser(id), cx);
+        if let Some(browser) = self.browsers.get(&id).cloned() {
+            browser.update(cx, |browser, cx| {
+                browser.open_document(path, html, window, cx)
+            });
+        }
+    }
+
+    fn add_browser_surface_with(
+        &mut self,
+        start: BrowserStart,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.active_chat.is_empty() {
             return;
         }
@@ -3568,12 +3630,10 @@ impl Shell {
             .or_default()
             .push(RightSurface::Browser(id));
         self.set_right_active(RightSurface::Browser(id), cx);
-        browser.update(cx, |browser, cx| {
-            if let Some(url) = url {
-                browser.navigate(&url, window, cx);
-            } else {
-                browser.focus_address(window, cx);
-            }
+        browser.update(cx, |browser, cx| match start {
+            BrowserStart::Url(url) => browser.navigate(&url, window, cx),
+            BrowserStart::Document { path, html } => browser.open_document(path, html, window, cx),
+            BrowserStart::Empty => browser.focus_address(window, cx),
         });
     }
 
@@ -3706,6 +3766,9 @@ impl Shell {
                         {
                             cx.open_url(&url);
                         }
+                    }
+                    FilesEvent::PreviewHtml { path, html } => {
+                        this.open_html_preview(path.clone(), html.clone(), window, cx)
                     }
                     FilesEvent::TitleChanged => cx.notify(),
                     FilesEvent::FileRenamed { old_path, new_path } => {

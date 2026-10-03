@@ -194,6 +194,11 @@ pub enum FilesEvent {
     OpenFile(String),
     RevealFile(String),
     OpenWebLink(crate::markdown::render::LinkActivation),
+    /// Render this HTML text in a Browser tab of the file's conversation.
+    PreviewHtml {
+        path: String,
+        html: String,
+    },
     TitleChanged,
     FileRenamed {
         old_path: String,

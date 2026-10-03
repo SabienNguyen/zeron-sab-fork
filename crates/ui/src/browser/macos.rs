@@ -156,6 +156,8 @@ struct ObserverState {
     pending: Cell<bool>,
     error: RefCell<Option<String>>,
     requested_url: RefCell<Option<String>>,
+    /// A workspace document commits as about:blank instead of a web address.
+    local: Cell<bool>,
 }
 
 define_class!(
@@ -178,7 +180,8 @@ define_class!(
             if allowed_navigation(&url) && unsafe { action.targetFrame() }.is_some_and(|frame| unsafe { frame.isMainFrame() }) {
                 *self.ivars().requested_url.borrow_mut() = Some(url.clone());
             }
-            decision.call((if allowed_navigation(&url) { WKNavigationActionPolicy::Allow } else { WKNavigationActionPolicy::Cancel },));
+            let document = self.ivars().local.get() && url == super::model::LocalDocument::ENGINE_URL;
+            decision.call((if allowed_navigation(&url) || document { WKNavigationActionPolicy::Allow } else { WKNavigationActionPolicy::Cancel },));
         }
         #[unsafe(method(webView:decidePolicyForNavigationResponse:decisionHandler:))]
         fn response(&self, _view: &WKWebView, response: &WKNavigationResponse, decision: &block2::Block<dyn Fn(WKNavigationResponsePolicy)>) {
@@ -226,6 +229,7 @@ impl Observer {
             pending: Cell::new(false),
             error: RefCell::new(None),
             requested_url: RefCell::new(None),
+            local: Cell::new(false),
         });
         unsafe { msg_send![super(object), init] }
     }
@@ -449,7 +453,15 @@ impl NativePage {
         host.data.register_preview(url);
         host.observer.ivars().error.borrow_mut().take();
         *host.observer.ivars().requested_url.borrow_mut() = Some(url.into());
+        host.observer.ivars().local.set(false);
         host.web.load_url(url).map_err(|e| e.to_string())
+    }
+    pub fn load_html(&self, html: &str) -> Result<(), String> {
+        let host = self.0.borrow();
+        host.observer.ivars().error.borrow_mut().take();
+        host.observer.ivars().requested_url.borrow_mut().take();
+        host.observer.ivars().local.set(true);
+        host.web.load_html(html).map_err(|e| e.to_string())
     }
     pub fn reload(&self) {
         let host = self.0.borrow();

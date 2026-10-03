@@ -238,6 +238,23 @@ impl NativePage {
     pub fn load(&self, url: &str) -> Result<(), String> {
         self.worker.send(self.id, json!({"cmd":"load","url":url}))
     }
+    /// The helper bounds each command, so a document crosses the pipe in
+    /// chunks. Escaping a chunk can grow it sixfold and still fit.
+    pub fn load_html(&self, html: &str) -> Result<(), String> {
+        const CHUNK: usize = 128 * 1024;
+        let mut rest = html;
+        while !rest.is_empty() {
+            let mut end = rest.len().min(CHUNK);
+            while !rest.is_char_boundary(end) {
+                end -= 1;
+            }
+            let (chunk, tail) = rest.split_at(end);
+            self.worker
+                .send(self.id, json!({"cmd":"html","data":chunk}))?;
+            rest = tail;
+        }
+        self.worker.send(self.id, json!({"cmd":"load-html"}))
+    }
     pub fn reload(&self) {
         self.command(json!({"cmd":"reload"}));
     }
@@ -345,6 +362,9 @@ impl super::BrowserSurface {
                 let mut page = native.state();
                 if page.url.is_none() {
                     page.url = self.page.url.clone();
+                }
+                if let Some(document) = &self.document {
+                    document.describe(&mut page);
                 }
                 if page.error.is_some() {
                     page.loading = false;

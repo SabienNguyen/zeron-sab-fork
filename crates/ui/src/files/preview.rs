@@ -371,6 +371,12 @@ fn estimated_highlighted_file_bytes(highlight: &HighlightedFile) -> usize {
         }))
 }
 
+/// HTML files open as source; a toolbar button renders them in a Browser tab.
+pub(super) fn is_html(path: &str) -> bool {
+    path.rsplit_once('.')
+        .is_some_and(|(_, ext)| matches!(ext.to_ascii_lowercase().as_str(), "html" | "htm"))
+}
+
 fn document_key(context: &FilesRequestContext, path: String) -> DocumentKey {
     DocumentKey {
         chat_id: context.target.chat_id.clone().unwrap_or_default(),
@@ -2304,6 +2310,7 @@ impl FilesSurface {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let markdown = super::markdown_preview::is_markdown(path);
+        let html = is_html(path) && self.html_preview_source(path, cx).is_some();
         let showing_markdown = self
             .preview
             .documents
@@ -2454,6 +2461,24 @@ impl FilesSurface {
                     ),
                 )
             })
+            .when(html, |element| {
+                element.child(
+                    toolbar_button("files-preview-html", "Preview HTML")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let Some(path) = this.preview.active.clone() else {
+                                return;
+                            };
+                            if let Some(html) = this.html_preview_source(&path, cx) {
+                                cx.emit(FilesEvent::PreviewHtml { path, html });
+                            }
+                        }))
+                        .child(
+                            icon(icons::EYE)
+                                .size(px(crate::surface_chrome::ICON_SIZE))
+                                .text_color(theme.text_muted),
+                        ),
+                )
+            })
             .when_some(save_status, |element, (label, color, retry, detail)| {
                 element.child(
                     div()
@@ -2528,6 +2553,18 @@ impl FilesSurface {
                 ),
             )
             .into_any_element()
+    }
+
+    /// The text a Browser tab renders for `path`: the editor's buffer, so
+    /// unsaved edits are previewed, or the loaded file before an editor exists.
+    /// A truncated read is never rendered as if it were the whole page.
+    fn html_preview_source(&self, path: &str, cx: &App) -> Option<String> {
+        let document = self.preview.documents.get(path)?;
+        let file = document.file.as_ref().filter(|file| !file.truncated)?;
+        match &document.editor {
+            Some(editor) => Some(editor.read(cx).value().to_string()),
+            None => file.text.clone(),
+        }
     }
 
     fn markdown_web_link_handler(cx: &Context<Self>) -> super::markdown_preview::WebLinkHandler {
@@ -3971,6 +4008,19 @@ impl FilesSurface {
             DocumentPhase::Saving
         };
         self.preview.documents.insert("test.rs".into(), document);
+    }
+}
+
+#[cfg(test)]
+mod html_preview_tests {
+    #[test]
+    fn only_html_extensions_offer_a_browser_preview() {
+        for path in ["index.html", "docs/Report.HTML", "legacy.htm"] {
+            assert!(super::is_html(path), "{path}");
+        }
+        for path in ["notes.md", "html", "page.html.bak", "template.xhtml"] {
+            assert!(!super::is_html(path), "{path}");
+        }
     }
 }
 
