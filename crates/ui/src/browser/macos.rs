@@ -180,7 +180,7 @@ define_class!(
             if allowed_navigation(&url) && unsafe { action.targetFrame() }.is_some_and(|frame| unsafe { frame.isMainFrame() }) {
                 *self.ivars().requested_url.borrow_mut() = Some(url.clone());
             }
-            let document = self.ivars().local.get() && url == super::model::LocalDocument::ENGINE_URL;
+            let document = self.ivars().local.get() && url.strip_prefix(super::model::LocalDocument::ENGINE_URL).is_some_and(|rest| rest.is_empty() || rest.starts_with('#'));
             decision.call((if allowed_navigation(&url) || document { WKNavigationActionPolicy::Allow } else { WKNavigationActionPolicy::Cancel },));
         }
         #[unsafe(method(webView:decidePolicyForNavigationResponse:decisionHandler:))]

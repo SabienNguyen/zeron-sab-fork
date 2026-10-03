@@ -1,6 +1,8 @@
 // WebKitGTK runs in its own process. Only rendered pixels and explicit browser
 // commands cross the pipe; GPUI owns all visible windows and input routing.
+#define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <glib-unix.h>
 #include <json-glib/json-glib.h>
 #include <signal.h>
@@ -202,8 +204,9 @@ static gboolean policy(WebKitWebView *web, WebKitPolicyDecision *decision,
         WebKitNavigationAction *action = webkit_navigation_policy_decision_get_navigation_action(
             WEBKIT_NAVIGATION_POLICY_DECISION(decision));
         const char *uri = webkit_uri_request_get_uri(webkit_navigation_action_get_request(action));
-        if (type == WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION && p->local &&
-            !g_strcmp0(uri, "about:blank"))
+        // A document's own anchors navigate within its blank address.
+        if (type == WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION && p->local && uri &&
+            (!strcmp(uri, "about:blank") || g_str_has_prefix(uri, "about:blank#")))
             return FALSE;
         if (!allowed(uri)) {
             webkit_policy_decision_ignore(decision);
@@ -348,20 +351,30 @@ static gboolean render_frames(gpointer unused) {
         if (!p->visible || !p->dirty)
             continue;
         p->dirty = FALSE;
-        GdkPixbuf *pix = gtk_offscreen_window_get_pixbuf(GTK_OFFSCREEN_WINDOW(p->window));
-        if (!pix)
+        // Cairo's native-endian xRGB is already the BGRA byte order of GPUI's
+        // image atlas, so rows are copied without a per-channel conversion.
+        cairo_surface_t *backing = gtk_offscreen_window_get_surface(GTK_OFFSCREEN_WINDOW(p->window));
+        if (!backing)
             continue;
-        guint w = gdk_pixbuf_get_width(pix), h = gdk_pixbuf_get_height(pix),
-              channels = gdk_pixbuf_get_n_channels(pix);
-        guint stride = gdk_pixbuf_get_rowstride(pix);
-        const guchar *src = gdk_pixbuf_read_pixels(pix);
+        cairo_surface_t *image = cairo_surface_map_to_image(backing, NULL);
+        cairo_format_t format = cairo_image_surface_get_format(image);
+        if (cairo_surface_status(image) != CAIRO_STATUS_SUCCESS ||
+            (format != CAIRO_FORMAT_ARGB32 && format != CAIRO_FORMAT_RGB24) ||
+            G_BYTE_ORDER != G_LITTLE_ENDIAN) {
+            cairo_surface_unmap_image(backing, image);
+            continue;
+        }
+        cairo_surface_flush(image);
+        guint w = cairo_image_surface_get_width(image), h = cairo_image_surface_get_height(image);
+        guint stride = cairo_image_surface_get_stride(image);
+        const guchar *src = cairo_image_surface_get_data(image);
         if (w > MAX_DIMENSION || h > MAX_DIMENSION) {
-            g_object_unref(pix);
+            cairo_surface_unmap_image(backing, image);
             continue;
         }
         if (w != p->width || h != p->height) {
             p->dirty = TRUE;
-            g_object_unref(pix);
+            cairo_surface_unmap_image(backing, image);
             continue;
         }
         guint length = 12 + w * h * 4;
@@ -372,19 +385,16 @@ static gboolean render_frames(gpointer unused) {
         guint32 scale_bits;
         memcpy(&scale_bits, &scale, 4);
         ((guint32 *)out)[2] = GUINT32_TO_LE(scale_bits);
-        for (guint y = 0; y < h; y++)
-            for (guint x = 0; x < w; x++) {
-                const guchar *s = src + y * stride + x * channels;
-                guchar *d = out + 12 + (y * w + x) * 4;
-                // GPUI's image atlas uses BGRA byte order.
-                d[0] = s[2];
-                d[1] = s[1];
-                d[2] = s[0];
-                d[3] = channels == 4 ? s[3] : 255;
-            }
+        for (guint y = 0; y < h; y++) {
+            guint32 *row = (guint32 *)(out + 12 + (gsize)y * w * 4);
+            memcpy(row, src + (gsize)y * stride, (gsize)w * 4);
+            // The page is opaque; RGB24 leaves its alpha byte undefined.
+            for (guint x = 0; x < w; x++)
+                row[x] |= 0xff000000u;
+        }
         send_packet('F', p->id, out, length);
         g_free(out);
-        g_object_unref(pix);
+        cairo_surface_unmap_image(backing, image);
     }
     return G_SOURCE_CONTINUE;
 }
@@ -629,6 +639,8 @@ static gboolean read_commands(gint fd, GIOCondition condition, gpointer unused) 
 }
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
+    // A frame is megabytes; the default 64 KiB pipe costs a wakeup per chunk.
+    fcntl(STDOUT_FILENO, F_SETPIPE_SZ, 1024 * 1024);
     // Offscreen GTK surfaces need CPU-addressable frames, never native GL child windows.
     g_setenv("WEBKIT_DISABLE_DMABUF_RENDERER", "1", TRUE);
     g_setenv("GDK_SCALE", "1", TRUE);

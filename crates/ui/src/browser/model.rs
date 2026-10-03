@@ -74,7 +74,11 @@ impl LocalDocument {
 
     /// Following a link leaves the document; only its own page is relabelled.
     pub fn describe(&self, page: &mut PageState) {
-        if page.url.as_deref() == Some(Self::ENGINE_URL) {
+        // An anchor within the document appends a fragment to its address.
+        if page.url.as_deref().is_some_and(|url| {
+            url.strip_prefix(Self::ENGINE_URL)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('#'))
+        }) {
             page.url = Some(self.path.clone());
         }
         if page.url.as_deref() == Some(&self.path) && page.title.trim().is_empty() {
@@ -234,6 +238,9 @@ mod tests {
         page.title = "Quarterly report".into();
         document.describe(&mut page);
         assert_eq!(page.label(), "Quarterly report");
+        page.url = Some("about:blank#summary".into());
+        document.describe(&mut page);
+        assert_eq!(page.url.as_deref(), Some("docs/report.html"));
 
         let mut elsewhere = PageState {
             url: Some("https://example.com/".into()),
