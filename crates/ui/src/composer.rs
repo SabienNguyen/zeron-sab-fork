@@ -5299,6 +5299,10 @@ fn pasted_reference_tokens(text: &str, pasted: Range<usize>) -> Vec<(char, Menti
     tokens
 }
 
+/// How long a workspace and agent must stay selected before their catalog is
+/// fetched ahead of a trigger.
+const SLASH_PREWARM_DELAY: Duration = Duration::from_millis(250);
+
 /// Interpret the trigger before discovery so a disabled $ stays ordinary text.
 fn completion_trigger(
     text: &str,
@@ -5654,6 +5658,8 @@ pub struct Composer {
     /// Advertised invocations for the current device/harness/workspace.
     /// Invalidated on context changes; filtering stays local while typing.
     slash_cache: HashMap<String, Vec<InvocationCandidate>>,
+    /// Catalog identity already fetched ahead of a trigger, and its request.
+    slash_prewarm: Option<(String, Task<()>)>,
     /// Slash-popup row scroll — the stack overflows into a wheel/keyboard-
     /// scrollable list once it outgrows the card.
     slash_scroll: gpui::ScrollHandle,
@@ -5964,6 +5970,7 @@ impl Composer {
             slash_task: None,
             slash: SlashState::default(),
             slash_cache: HashMap::new(),
+            slash_prewarm: None,
             slash_scroll: gpui::ScrollHandle::new(),
             mention_scroll: gpui::ScrollHandle::new(),
             popup_bar: crate::popover::MenuScrollbarState::default(),
@@ -7272,6 +7279,7 @@ impl Composer {
             // Leaving a token must not replace the catalog identity with the
             // idle (commands_allowed=false) context and evict the warm cache.
             self.reset_slash(None, cx);
+            self.prewarm_slash(harness, preferences, cx);
             return;
         }
         let params = self.catalog_params(cx);
@@ -7343,6 +7351,12 @@ impl Composer {
             }
             return;
         };
+        // This open fetches the same catalog; a pending prewarm would repeat it.
+        if let Some((prewarmed, task)) = &mut self.slash_prewarm
+            && *prewarmed == self.slash.catalog_context
+        {
+            *task = Task::ready(());
+        }
         self.slash.request = self.slash.request.wrapping_add(1);
         let request = self.slash.request;
         self.slash.loading = true;
@@ -7423,6 +7437,97 @@ impl Composer {
             .ok();
         }));
         cx.notify();
+    }
+
+    /// Fetch the catalog once a workspace and agent settle, so the first `/`
+    /// or `$` opens on warm rows instead of waiting out a provider probe.
+    /// Opening still refreshes; this only moves the cold fetch ahead of it.
+    fn prewarm_slash(
+        &mut self,
+        harness: Option<HarnessId>,
+        preferences: crate::settings::SkillCompletionSettings,
+        cx: &mut Context<Self>,
+    ) {
+        if harness.is_none() {
+            return;
+        }
+        let params = self.catalog_params(cx);
+        let catalog_context = format!(
+            "{preferences:?}:{}:{params}",
+            self.completion_connection_context(cx),
+        );
+        if self
+            .slash_prewarm
+            .as_ref()
+            .is_some_and(|(context, _)| *context == catalog_context)
+        {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let context = catalog_context.clone();
+        let task = cx.spawn(async move |this, cx| {
+            // Passing through a chat on the way to another must not start a
+            // provider process for it.
+            cx.background_executor().timer(SLASH_PREWARM_DELAY).await;
+            let commands = async {
+                let value = engine
+                    .client()
+                    .call(methods::LIST_COMMANDS, params.clone())
+                    .await
+                    .ok()?;
+                serde_json::from_value::<Vec<SlashCommand>>(value).ok()
+            };
+            let skills = async {
+                let value = engine
+                    .client()
+                    .call(methods::LIST_SKILLS, params.clone())
+                    .await
+                    .ok()?;
+                serde_json::from_value::<Option<Vec<zeron_proto::invocation::Skill>>>(value).ok()
+            };
+            // A failure is left for the open itself to fetch and report.
+            let (Some(commands), Some(skills)) = futures::join!(commands, skills) else {
+                return;
+            };
+            this.update(cx, |composer, cx| {
+                // An open token for another catalog owns the cache now.
+                if composer.slash.token.is_some() && composer.slash.catalog_context != context {
+                    return;
+                }
+                if composer.slash.catalog_context != context {
+                    composer.slash_cache.clear();
+                    composer.slash.catalog_context = context.clone();
+                }
+                let include_skills = !preferences.separate_from_slash;
+                let mut rows = invocation_candidates(commands, skills.clone().unwrap_or_default());
+                if !include_skills {
+                    rows.retain(|row| row.invocation.prefix() == '/');
+                }
+                // Rows the open already fetched are fresher than these.
+                composer
+                    .slash_cache
+                    .entry(format!("command:{include_skills}:true:{context}"))
+                    .or_insert_with(|| {
+                        with_workspace_commands(
+                            rows,
+                            composer.state.read(cx).selected_chat.is_some(),
+                        )
+                    });
+                if let Some(skills) = skills.filter(|_| preferences.dollar) {
+                    composer
+                        .slash_cache
+                        .entry(format!("skill:true:false:{context}"))
+                        .or_insert_with(|| invocation_candidates(vec![], skills));
+                }
+                if composer.slash.token.is_some() {
+                    composer.refilter_slash(cx);
+                }
+            })
+            .ok();
+        });
+        self.slash_prewarm = Some((catalog_context, task));
     }
 
     /// Re-rank the cached list for the current query (pure local filter).
@@ -13380,6 +13485,105 @@ mod tests {
             });
             names[kind] = expected;
         }
+    }
+
+    #[gpui::test]
+    fn settled_workspace_prewarms_the_first_open(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _runtime = runtime.enter();
+        let directory = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            crate::settings::init(crate::settings::UiSettings::default(), directory.path(), cx);
+        });
+        let (out, mut requests) = tokio::sync::mpsc::channel(64);
+        let (replies, inbound) = tokio::sync::mpsc::channel(64);
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, _| {
+            state.set_test_engine(crate::state::EngineHandle::from_test_client(
+                zeron_rpc::RpcClient::new(out, inbound),
+            ));
+            state.chats = ["passing", "settled"]
+                .into_iter()
+                .map(|id| {
+                    serde_json::from_value(serde_json::json!({
+                        "id": id, "deviceId": "host", "archived": false,
+                        "cwd": format!("/{id}"), "createdAt": chrono::Utc::now(),
+                        "config": { "harness": "claude-code", "sandbox": "workspace-write" }
+                    }))
+                    .unwrap()
+                })
+                .collect();
+        });
+        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        let mut catalogs = || {
+            let mut frames = Vec::new();
+            while let Ok(frame) = requests.try_recv() {
+                let frame: zeron_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+                if matches!(
+                    frame.method.as_deref(),
+                    Some(methods::LIST_COMMANDS | methods::LIST_SKILLS)
+                ) {
+                    frames.push(frame);
+                }
+            }
+            frames
+        };
+        for chat in ["passing", "settled"] {
+            state.update(cx, |state, cx| {
+                state.selected_chat = Some(chat.into());
+                cx.notify();
+            });
+            cx.run_until_parked();
+            cx.executor().advance_clock(SLASH_PREWARM_DELAY / 2);
+            cx.run_until_parked();
+        }
+        assert!(catalogs().is_empty(), "a chat passed through is not probed");
+        cx.executor().advance_clock(SLASH_PREWARM_DELAY);
+        cx.run_until_parked();
+        let prewarm = catalogs();
+        assert_eq!(prewarm.len(), 2);
+        for frame in prewarm {
+            assert_eq!(frame.params["cwd"], "/settled");
+            let value = if frame.method.as_deref() == Some(methods::LIST_COMMANDS) {
+                serde_json::json!([{ "name": "warm-command", "description": "Provider command" }])
+            } else {
+                serde_json::json!([])
+            };
+            replies
+                .try_send(
+                    serde_json::to_string(&zeron_rpc::ServerFrame {
+                        id: frame.id,
+                        ok: Some(value),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        runtime.block_on(async { tokio::task::yield_now().await });
+        cx.run_until_parked();
+        composer.update(cx, |composer, cx| {
+            composer
+                .input
+                .update(cx, |input, cx| input.set_text("/", cx));
+        });
+        cx.run_until_parked();
+        composer.read_with(cx, |composer, _| {
+            let rows = &composer.slash_cache[&composer.slash.context];
+            assert!(
+                composer
+                    .slash
+                    .filtered
+                    .iter()
+                    .any(|&index| rows[index].name == "warm-command"),
+                "the first open shows prewarmed rows"
+            );
+            assert!(composer.slash.loading, "each open refreshes the catalog");
+        });
+        assert_eq!(catalogs().len(), 2);
     }
 
     #[gpui::test]
