@@ -898,6 +898,56 @@ async fn a_replay_confirms_superseded_steers_and_the_turn_ends() {
     ));
 }
 
+/// A `now` steer aborts the turn in flight, and the CLI reports that turn
+/// with a diagnostic-only error result. That result is a steer boundary: the
+/// run must not end as failed while the steer is still being answered,
+/// however long the answer takes to start or however quiet it goes.
+async fn steered_run_ends_once_and_completed(scenario: &str) {
+    let (controls, steer, _token) = controls("A");
+    steer
+        .send(SteerMessage {
+            prompt: "a steer".into(),
+            message_id: None,
+        })
+        .await
+        .expect("steer queued");
+    let events = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        run_to_end(&harness(), request(scenario), controls),
+    )
+    .await
+    .expect("run must end");
+    let dones: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::Done { .. }))
+        .collect();
+    assert_eq!(dones.len(), 1, "one turn end: {dones:?}");
+    assert!(
+        matches!(
+            dones[0],
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        ),
+        "{dones:?}"
+    );
+    assert!(events.contains(&AgentEvent::TextDelta {
+        text: "answered".into()
+    }));
+    assert!(matches!(events.last(), Some(AgentEvent::Done { .. })));
+}
+
+#[tokio::test]
+async fn a_steer_answered_after_the_settle_window_does_not_fail_the_run() {
+    steered_run_ends_once_and_completed("scenario:slow-steer-answer").await;
+}
+
+#[tokio::test]
+async fn a_quiet_spell_after_a_replayed_steer_does_not_fail_the_run() {
+    steered_run_ends_once_and_completed("scenario:quiet-after-replay").await;
+}
+
 /// A steer the CLI never replays must not hold the turn end forever.
 #[tokio::test]
 async fn an_unreplayed_steer_releases_the_turn_end() {

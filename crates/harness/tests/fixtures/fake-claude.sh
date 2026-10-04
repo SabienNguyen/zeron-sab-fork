@@ -143,6 +143,34 @@ case "$first" in
   emit '{"type":"result","subtype":"success","result":"answered-both","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-sup"}'
   ;;
 
+*scenario:slow-steer-answer*)
+  # A `now` steer aborts the turn in flight; the CLI reports that turn with a
+  # diagnostic-only result, then takes longer than the settle window to
+  # replay the steer and answer it (a large context's first-token latency).
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-slow"}'
+  emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"story"}}}'
+  read -r steer || exit 1
+  emit '{"type":"result","subtype":"error_during_execution","errors":["[ede_diagnostic] turn aborted by a newer message"],"usage":{"input_tokens":0,"output_tokens":0},"session_id":"sess-slow"}'
+  sleep 7
+  emit "$steer"
+  emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"answered"}}}'
+  emit '{"type":"result","subtype":"success","result":"answered","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-slow"}'
+  ;;
+
+*scenario:quiet-after-replay*)
+  # The steer is replayed at once, but the answering turn then goes quiet for
+  # longer than the settle window (thinking, or a slow tool) before it ends.
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-quiet"}'
+  emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"story"}}}'
+  read -r steer || exit 1
+  emit '{"type":"result","subtype":"error_during_execution","errors":["[ede_diagnostic] turn aborted by a newer message"],"usage":{"input_tokens":0,"output_tokens":0},"session_id":"sess-quiet"}'
+  emit "$steer"
+  emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"considering"}}}'
+  sleep 7
+  emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"answered"}}}'
+  emit '{"type":"result","subtype":"success","result":"answered","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-quiet"}'
+  ;;
+
 *scenario:absorbed-steer*)
   # A steer whose replay never comes: the turn end must not be held forever.
   emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-abs"}'

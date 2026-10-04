@@ -738,6 +738,19 @@ struct Session {
     stderr_tail: crate::StderrTail,
 }
 
+/// Whether a held turn end may be released after a quiet spell. Only a turn
+/// that completed on its own can have absorbed its steers; an aborted turn's
+/// result waits for the steer's own turn, or for the CLI to exit.
+fn settles(done: &AgentEvent) -> bool {
+    matches!(
+        done,
+        AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        }
+    )
+}
+
 /// The per-run event loop: one task multiplexing stdout frames, the steering
 /// mailbox, the interrupt token, and consumer liveness.
 async fn run_session(session: Session) {
@@ -773,8 +786,12 @@ async fn run_session(session: Session) {
     // A turn end held back while steers wait for their replay. Rapid `now`
     // steers each interrupt the turn the previous one started, and the CLI
     // replays only the last (verified on 2.1.280; the earlier texts still
-    // reach the model). If nothing follows the held result, the steers were
-    // absorbed: release them and the turn end instead of spinning forever.
+    // reach the model). If nothing follows a turn that ended on its own, the
+    // steers were absorbed: release them and the turn end instead of
+    // spinning forever. A turn the steer aborted is different: its result is
+    // only the boundary, the answer is still to come, and a large context can
+    // take longer than this to start it — releasing that result would end
+    // the run as failed while the CLI is still working (see `settles`).
     const HELD_DONE_SETTLE: Duration = Duration::from_secs(5);
     let mut held_done: Option<(AgentEvent, tokio::time::Instant)> = None;
     let mut done_after_interrupt = false;
@@ -822,6 +839,10 @@ async fn run_session(session: Session) {
                                 .as_ref()
                                 .and_then(|id| pending_steers.iter().position(|p| p == id))
                         {
+                            // The steer continues the run, so the result
+                            // held at its boundary is not the run's end:
+                            // the steered turn reports its own.
+                            held_done = None;
                             for _ in 0..=at {
                                 pending_steers.pop_front();
                                 let (prev, next) = norm.rotate_for_steer();
@@ -911,7 +932,7 @@ async fn run_session(session: Session) {
 
             _ = tokio::time::sleep_until(
                 held_done.as_ref().map_or_else(tokio::time::Instant::now, |(_, d)| *d)
-            ), if held_done.is_some() => {
+            ), if held_done.as_ref().is_some_and(|(done, _)| settles(done)) => {
                 // The steers were absorbed into the turn that just ended.
                 while pending_steers.pop_front().is_some() {
                     let (prev, next) = norm.rotate_for_steer();
