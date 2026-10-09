@@ -1,7 +1,8 @@
 //! Session notification sounds — the herdr approach (state-transition chimes
 //! played through the platform's own audio CLI, zero Rust audio deps):
 //!
-//! - embedded completion, input-request, attention and Appshot chimes;
+//! - embedded completion, input-request, attention and Appshot chimes, and
+//!   the start and end of a voice call;
 //! - each session chime can be replaced by a user-chosen audio file
 //!   ([`CustomSounds`]); an unplayable file falls back to the embedded chime;
 //! - macOS Appshots use a preloaded native player; other cues write to a
@@ -29,6 +30,8 @@ static SOUND_APPSHOT: &[u8] = include_bytes!("../assets/sounds/appshot.wav");
 static SOUND_DONE: &[u8] = include_bytes!("../assets/sounds/done.wav");
 static SOUND_REQUEST: &[u8] = include_bytes!("../assets/sounds/request.wav");
 static SOUND_ATTENTION: &[u8] = include_bytes!("../assets/sounds/attention.wav");
+static SOUND_VOICE_START: &[u8] = include_bytes!("../assets/sounds/voice-start.wav");
+static SOUND_VOICE_END: &[u8] = include_bytes!("../assets/sounds/voice-end.wav");
 
 /// Which notification chime to play.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +119,17 @@ pub fn play(sound: Sound, custom: Option<&Path>) {
         Sound::Attention => SOUND_ATTENTION,
     };
     play_in_background(data, custom.map(Path::to_path_buf));
+}
+
+/// A voice call starting (`true`) or ending. Only its two ends sound: the
+/// caller plays each once per call, never in between.
+pub fn play_voice(start: bool) {
+    let data = if start {
+        SOUND_VOICE_START
+    } else {
+        SOUND_VOICE_END
+    };
+    play_in_background(data, None);
 }
 
 /// Confirm captured pixels with a soft shutter and clear chime.

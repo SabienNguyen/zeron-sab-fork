@@ -60,6 +60,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
+        realtime: None,
         execution_lease: None,
         request_input: Box::new(move |questions: Vec<UserInputQuestion>| {
             let (tx, rx) = oneshot::channel();
@@ -75,6 +76,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
         }),
         steering: steer_rx,
         interrupt: token.clone(),
+        turn: Default::default(),
     };
     (controls, steer_tx, token)
 }
@@ -158,6 +160,8 @@ async fn delayed_turn(scenario: &str) {
         .send(SteerMessage {
             message_id: None,
             prompt: "second".into(),
+            attachments: Vec::new(),
+            config: None,
         })
         .await
         .unwrap();
@@ -165,6 +169,8 @@ async fn delayed_turn(scenario: &str) {
         .send(SteerMessage {
             message_id: None,
             prompt: "third".into(),
+            attachments: Vec::new(),
+            config: None,
         })
         .await
         .unwrap();
@@ -207,6 +213,8 @@ async fn delayed_turn(scenario: &str) {
         .send(SteerMessage {
             message_id: None,
             prompt: "fourth".into(),
+            attachments: Vec::new(),
+            config: None,
         })
         .await
         .unwrap();
@@ -271,6 +279,8 @@ async fn cancel_quiet(scenario: &str) {
         .send(SteerMessage {
             message_id: None,
             prompt: "must not run".into(),
+            attachments: Vec::new(),
+            config: None,
         })
         .await
         .unwrap();

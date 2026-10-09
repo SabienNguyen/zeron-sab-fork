@@ -97,6 +97,14 @@ fn front_page_mirrors_the_desktop_sidebar() {
     let zeron = ws.project("space-zeron").unwrap();
     assert_eq!(zeron.indicator, ChatIndicator::AwaitingInput);
     assert!(zeron.unseen_count >= 2);
+    // Clones of one repository are one project, with one name and color.
+    let clone = ws.project("space-zeron-vps").unwrap();
+    assert_eq!(clone.group_key, zeron.group_key);
+    assert_eq!(clone.group_name, "zeron");
+    assert_eq!(clone.color_index, zeron.color_index);
+    let cjk = ws.session("chat-cjk").unwrap();
+    assert_eq!(cjk.project.as_ref().unwrap().color_index, zeron.color_index);
+    assert_ne!(ws.project("space-edge").unwrap().group_key, zeron.group_key);
     assert_eq!(ids(&ws.projectless), ["chat-home"]);
     assert!(ws.devices.iter().any(|d| d.is_self && d.id == "ios-test"));
     assert!(!ws.device("dev-studio").unwrap().online);
@@ -175,7 +183,10 @@ fn send_streams_a_reply_and_adopts_the_echo() {
     assert_eq!(echo.pending.len(), 1);
     assert_eq!(echo.pending[0].message_id, message_id);
     assert!(echo.entry(&message_id).unwrap().echo.is_some());
-    assert!(echo.working, "a send in flight reads as working");
+    assert!(
+        !echo.working,
+        "a pending send is not confirmed host activity"
+    );
 
     let (tx, rx) = std::sync::mpsc::channel();
     let _watch = session.watch(move |snap| {
@@ -249,8 +260,7 @@ fn questions_answer_through_respond_input() {
     });
     // The host publishes the question, then flips the chat's status.
     wait_for("awaiting input", Duration::from_secs(5), || {
-        client.workspace().session("chat-deploy").unwrap().indicator
-            == ChatIndicator::AwaitingInput
+        client.workspace().session("chat-deploy").unwrap().indicator == ChatIndicator::AwaitingInput
     });
     let input = session.composer().open_input.clone().unwrap();
     session

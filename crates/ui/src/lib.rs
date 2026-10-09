@@ -48,11 +48,14 @@ mod new_thread_background_image;
 mod new_thread_background_mask;
 mod notice;
 pub mod notify;
+pub mod orb;
 pub mod pickers;
 pub mod popover;
 pub mod project_actions;
 pub mod queue;
 pub mod rail;
+mod roll_text;
+pub mod running_pill;
 pub mod settings;
 pub mod shell;
 pub mod sound;
@@ -61,10 +64,12 @@ pub(crate) mod surface_chrome;
 pub mod syntax_cache;
 pub mod terminal;
 mod todo_panel;
+pub(crate) mod tool_images;
 pub mod theme;
 pub mod theme_library;
 pub mod transcript;
 pub mod typography;
+pub mod voice;
 mod workspace_links;
 
 use std::path::PathBuf;
@@ -197,7 +202,11 @@ pub fn run_app(config: UiConfig) {
         app_update::AppUpdate::init(config.boot().edge_url, data_dir.clone(), cx);
         cx.register_url_scheme("zeron").detach();
 
-        let state = cx.new(|_| state::AppState::new());
+        let state = cx.new(|cx| {
+            let mut state = state::AppState::new();
+            state.watch_clock_transitions(cx);
+            state
+        });
         let url_state = state.clone();
         cx.spawn(async move |cx| {
             while let Some(url) = url_rx.next().await {

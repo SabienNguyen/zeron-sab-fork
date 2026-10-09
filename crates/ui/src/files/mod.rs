@@ -35,6 +35,7 @@ pub mod preview;
 mod rename;
 pub mod search;
 mod sections;
+mod subagents;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tree;
@@ -615,6 +616,7 @@ impl FilesSurface {
             ComposerInputEvent::PastedImages(_)
             | ComposerInputEvent::PastedPaths(_)
             | ComposerInputEvent::PastedText { .. }
+            | ComposerInputEvent::OpenAttachment(_)
             | ComposerInputEvent::CursorMoved
             | ComposerInputEvent::ViewportChanged => {}
         });

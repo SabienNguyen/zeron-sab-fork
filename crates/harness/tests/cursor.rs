@@ -50,6 +50,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
+        realtime: None,
         execution_lease: None,
         request_input: Box::new(move |_| {
             let (tx, rx) = oneshot::channel();
@@ -58,6 +59,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
         }),
         steering: steer_rx,
         interrupt: token.clone(),
+        turn: Default::default(),
     };
     (controls, steer_tx, token)
 }
@@ -187,6 +189,8 @@ async fn steer_after_done_becomes_the_next_turn() {
                         .send(SteerMessage {
                             prompt: "follow up".into(),
                             message_id: None,
+                            attachments: Vec::new(),
+                            config: None,
                         })
                         .await
                         .expect("steer sent");
@@ -338,6 +342,8 @@ async fn followup_crash_is_not_hidden_by_a_previous_completed_turn() {
                         .send(SteerMessage {
                             prompt: "follow up".into(),
                             message_id: None,
+                            attachments: Vec::new(),
+                            config: None,
                         })
                         .await
                         .unwrap();
@@ -393,6 +399,8 @@ async fn steering_spam_preserves_every_turn_in_order_and_closes_cleanly() {
                     .send(SteerMessage {
                         prompt: format!("ITEM-{n}"),
                         message_id: None,
+                        attachments: Vec::new(),
+                        config: None,
                     })
                     .await
                     .unwrap();
@@ -460,6 +468,8 @@ async fn cancelling_a_native_steering_burst_stops_without_starting_another_turn(
                 .send(SteerMessage {
                     prompt: format!("LIVE-STEER-{n}"),
                     message_id: None,
+                    attachments: Vec::new(),
+                    config: None,
                 })
                 .await
                 .unwrap();

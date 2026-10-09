@@ -22,6 +22,7 @@ pub mod chat2_host;
 mod chat_persistence;
 pub mod diff_sync;
 pub mod doc_host;
+mod fs_watch;
 pub mod harness_updates;
 mod http_error;
 pub mod instance_lock;
@@ -40,6 +41,7 @@ pub mod terminals;
 pub mod titles;
 mod transcript_history;
 pub mod uploads;
+pub mod voice;
 pub mod workspace_files;
 pub mod workspace_host;
 
@@ -47,7 +49,7 @@ pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
 pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
 pub use change_requests::{ChangeRequestCacheKey, CheckoutChangeRequests};
 pub use diff_sync::{
-    CheckoutDiffSync, DiffFileTextPair, DiffSidecar, DiffSnapshot, TurnSnapshot,
+    CheckoutDiffSync, DiffFileTextPair, DiffSidecar, DiffSnapshot, TreeSnapshot, TurnSnapshot,
     capture_commit_diff, capture_diff, capture_diff_against, capture_turn_diff,
     discard_working_tree, merge_base, read_diff_file_text, snapshot_tree, working_diff_base,
 };
@@ -241,6 +243,7 @@ impl EngineCore {
                 org_id: profile.org_id().to_string(),
                 user_id: profile.user_id().to_string(),
                 edge: edge.clone(),
+                local_only: matches!(profile.scope(), WorkspaceScope::Local),
             },
         )?;
         doc_host.set_workspace(workspace.clone());

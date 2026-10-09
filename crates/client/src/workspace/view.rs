@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use zeron_doc::WorkspaceState;
-use zeron_proto::view::{attention_rank, display_status};
+use zeron_proto::view::{attention_rank, display_status, project_key, representative_space};
 use zeron_proto::{
     ChangeRequestState, ChangeRequestSummary, Chat, ChatIndicator, CheckoutChangeRequestStatus,
     Device, Session, SidebarPreferences, Space,
@@ -32,9 +32,9 @@ pub const PROJECT_COLOR_COUNT: u32 = 8;
 /// monogram tone: 32-bit FNV-1a of the project's path (`"home"` without a
 /// project), so a project has the same color on every device.
 pub fn project_color_index(space_path: &str) -> u32 {
-    let hash = space_path
-        .bytes()
-        .fold(2_166_136_261u32, |h, b| (h ^ u32::from(b)).wrapping_mul(16_777_619));
+    let hash = space_path.bytes().fold(2_166_136_261u32, |h, b| {
+        (h ^ u32::from(b)).wrapping_mul(16_777_619)
+    });
     hash % PROJECT_COLOR_COUNT
 }
 
@@ -80,9 +80,8 @@ pub struct SessionRow {
     pub branch: Option<String>,
     pub cwd: Option<String>,
     pub indicator: ChatIndicator,
-    /// The host-reported status alone (45s staleness-gated) — `indicator`
-    /// minus the "a send of mine is in flight" override. What stop/busy
-    /// logic keys off (a send parked for an offline host is not a turn).
+    /// Host-reported status (45s staleness-gated). Stop/busy logic keys off
+    /// this; an outgoing send is not evidence of a running turn.
     pub host_indicator: ChatIndicator,
     /// Run start of the live turn while Working/AwaitingInput.
     pub working_since_ms: Option<i64>,
@@ -131,6 +130,13 @@ pub struct ProjectView {
     pub device_online: bool,
     pub git_detected: bool,
     pub created_at_ms: i64,
+    /// The repository project this checkout belongs to
+    /// ([`zeron_proto::view::project_key`]): clones and worktrees of one
+    /// repository, on any device, share it.
+    pub group_key: String,
+    /// The group's name — its representative checkout's — shared by every
+    /// member, like `color_index`.
+    pub group_name: String,
     /// Most urgent indicator among its active sessions (Idle when none).
     pub indicator: ChatIndicator,
     pub unseen_count: u32,
@@ -411,6 +417,7 @@ fn hash_row(row: &SessionRow) -> u64 {
 }
 
 struct RowContext<'a> {
+    all_spaces: &'a [Space],
     spaces: HashMap<&'a str, &'a Space>,
     devices: HashMap<&'a str, &'a Device>,
     sessions: HashMap<&'a str, &'a Session>,
@@ -423,21 +430,13 @@ fn build_row(chat: &Chat, rc: &RowContext<'_>, cx: &DeriveContext<'_>) -> Arc<Se
     let session = rc.sessions.get(chat.id.as_str()).copied();
     let send_state = cx.send_states.get(&chat.id).copied();
     let host_indicator = display_status(chat, session, cx.now);
-    let mut indicator = host_indicator;
-    let mut working_since_ms = match indicator {
+    let indicator = host_indicator;
+    let working_since_ms = match indicator {
         ChatIndicator::Working | ChatIndicator::AwaitingInput => session
             .and_then(|s| s.started_at)
             .map(|t| t.timestamp_millis()),
         _ => None,
     };
-    // A send in flight reads as Working (desktop `display_status_for`).
-    if matches!(send_state, Some(SendState::Sending | SendState::Queued))
-        && indicator != ChatIndicator::Working
-        && indicator != ChatIndicator::AwaitingInput
-    {
-        indicator = ChatIndicator::Working;
-        working_since_ms = None;
-    }
     let project = chat
         .space_id
         .as_deref()
@@ -445,7 +444,8 @@ fn build_row(chat: &Chat, rc: &RowContext<'_>, cx: &DeriveContext<'_>) -> Arc<Se
         .map(|space| ProjectRef {
             id: space.id.clone(),
             name: space.display_name().to_owned(),
-            color_index: project_color_index(&space.path),
+            // Clones of one repository share their representative's color.
+            color_index: project_color_index(&representative_space(rc.all_spaces, space).path),
         });
     let device = rc.devices.get(chat.device_id.as_str());
     let config = chat.config.as_ref();
@@ -536,6 +536,7 @@ pub(crate) fn derive(
         }
     }
     let rc = RowContext {
+        all_spaces: &state.spaces,
         spaces: state.spaces.iter().map(|s| (s.id.as_str(), s)).collect(),
         devices: state.devices.iter().map(|d| (d.id.as_str(), d)).collect(),
         sessions: state
@@ -557,7 +558,7 @@ pub(crate) fn derive(
     let mut active: Vec<&Chat> = state
         .chats
         .iter()
-        .filter(|c| !c.archived && c.parent_chat_id.is_none())
+        .filter(|c| !c.archived && c.is_top_level())
         .filter(|c| {
             c.space_id
                 .as_deref()
@@ -617,11 +618,12 @@ pub(crate) fn derive(
                 .map(|r| r.indicator)
                 .min_by_key(|i| attention_rank(*i))
                 .unwrap_or(ChatIndicator::Idle);
+            let representative = representative_space(&state.spaces, space);
             ProjectView {
                 id: space.id.clone(),
                 name: space.display_name().to_owned(),
                 path: space.path.clone(),
-                color_index: project_color_index(&space.path),
+                color_index: project_color_index(&representative.path),
                 device_id: space.device_id.clone(),
                 device_name: rc
                     .devices
@@ -635,6 +637,8 @@ pub(crate) fn derive(
                 ),
                 git_detected: space.git_detected,
                 created_at_ms: space.created_at.timestamp_millis(),
+                group_key: project_key(space),
+                group_name: representative.display_name().to_owned(),
                 indicator,
                 unseen_count: sessions.iter().filter(|r| r.unseen).count() as u32,
                 sessions,
@@ -661,7 +665,7 @@ pub(crate) fn derive(
     let mut archived_chats: Vec<&Chat> = state
         .chats
         .iter()
-        .filter(|c| c.archived && c.parent_chat_id.is_none())
+        .filter(|c| c.archived && c.is_top_level())
         .collect();
     sort_recency(&mut archived_chats);
     let archived: Vec<Arc<SessionRow>> = archived_chats.iter().map(|c| row(c)).collect();
@@ -751,6 +755,9 @@ fn snapshot_hash(s: &WorkspaceSnapshot) -> u64 {
         project.id.hash(&mut h);
         project.name.hash(&mut h);
         project.path.hash(&mut h);
+        project.color_index.hash(&mut h);
+        project.group_key.hash(&mut h);
+        project.group_name.hash(&mut h);
         project.device_name.hash(&mut h);
         project.device_online.hash(&mut h);
         project.git_detected.hash(&mut h);

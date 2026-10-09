@@ -17,6 +17,7 @@ final class AppModel {
         var awaiting = 0
     }
 
+    @MainActor lazy var voice = RemoteVoiceController(app: self)
     private(set) var client: CoreClient?
     private(set) var frontPage = FrontPage()
     private(set) var archived: [SessionRowVM] = []
@@ -196,7 +197,8 @@ final class AppModel {
     }
 
     /// The user signing out: this device forgets the account's local docs.
-    func signOut() {
+    @MainActor func signOut() {
+        voice.stop()
         forgetOnSignOut = true
         onSignOut?()
     }
@@ -206,7 +208,10 @@ final class AppModel {
     /// keeps a different account out of it.
     private var forgetOnSignOut = false
 
-    func signOutLocally() {
+    @MainActor func signOutLocally() {
+        voice.stop()
+        endDeliveryBackgroundTask()
+        lastDeliveryActivity = .distantPast
         client?.shutdown()
         client = nil
         Credentials.clearStored()
@@ -228,8 +233,38 @@ final class AppModel {
         newSessionImages = []
     }
 
-    func didEnterBackground() { client?.onBackground() }
+    private var lastDeliveryActivity = Date.distantPast
+
+    func noteDeliveryActivity() { lastDeliveryActivity = Date() }
+
+    private var deliveryBackgroundTask: UIBackgroundTaskIdentifier = .invalid
+    private var deliveryBackgroundDeadline: DispatchWorkItem?
+
+    private func endDeliveryBackgroundTask() {
+        deliveryBackgroundDeadline?.cancel()
+        deliveryBackgroundDeadline = nil
+        guard deliveryBackgroundTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(deliveryBackgroundTask)
+        deliveryBackgroundTask = .invalid
+    }
+
+    func didEnterBackground() {
+        // Give the already-durable room outbox and host wake time to reach
+        // the edge when the user leaves immediately after tapping Send.
+        endDeliveryBackgroundTask()
+        if client != nil, !isDemo,
+           Date().timeIntervalSince(lastDeliveryActivity) < 120 || rows.values.contains(where: { $0.sendState == .sending || $0.sendState == .queued }) {
+            deliveryBackgroundTask = UIApplication.shared.beginBackgroundTask(withName: "Finish message delivery") { [weak self] in
+                self?.endDeliveryBackgroundTask()
+            }
+            let deadline = DispatchWorkItem { [weak self] in self?.endDeliveryBackgroundTask() }
+            deliveryBackgroundDeadline = deadline
+            DispatchQueue.main.asyncAfter(deadline: .now() + 25, execute: deadline)
+        }
+        client?.onBackground()
+    }
     func willEnterForeground() {
+        endDeliveryBackgroundTask()
         client?.onForeground()
         refreshWorkspace()
     }
@@ -436,11 +471,15 @@ final class AppModel {
 
     // MARK: Sessions
 
-    func sessionSource(_ chatId: String) -> SessionSource {
-        guard let client, let handle = try? client.openSession(chatId: chatId) else {
-            return FixtureSessionSource(title: "Unavailable", subtitle: "")
+    func sessionSource(_ chatId: String) -> SessionSource? {
+        guard let client else { return nil }
+        do {
+            let handle = try client.openSession(chatId: chatId)
+            return CoreSessionSource(app: self, client: client, handle: handle, chatId: chatId)
+        } catch {
+            NSLog("open session failed: \(error)")
+            return nil
         }
-        return CoreSessionSource(app: self, client: client, handle: handle, chatId: chatId)
     }
 
     // MARK: New session
@@ -476,7 +515,7 @@ final class AppModel {
     }
 
     var projectOptions: [ProjectOption] {
-        rawProjects.map { ProjectOption(id: $0.id, name: $0.name, device: $0.deviceId, deviceName: $0.deviceName ?? deviceName($0.deviceId), online: $0.deviceOnline, git: $0.gitDetected, colorIndex: Int($0.colorIndex)) }
+        rawProjects.map { ProjectOption(id: $0.id, name: $0.name, path: $0.path, device: $0.deviceId, deviceName: $0.deviceName ?? deviceName($0.deviceId), online: $0.deviceOnline, git: $0.gitDetected, groupKey: $0.groupKey, groupName: $0.groupName, colorIndex: Int($0.colorIndex)) }
     }
 
     var hostOptions: [HostOption] {
@@ -545,6 +584,7 @@ final class AppModel {
             let project = rawProjects.first { $0.id == draft.projectId }
             let worktree = draft.worktree ? project.map { WorktreeSpec(repoPath: $0.path, base: draft.branch ?? "HEAD", spaceId: $0.id) } : nil
             _ = try handle.send(request: SendRequest(text: text, attachments: images.map(\.outgoing), worktree: worktree, busy: .queue))
+            noteDeliveryActivity()
             refreshWorkspace()
             return chatId
         } catch {

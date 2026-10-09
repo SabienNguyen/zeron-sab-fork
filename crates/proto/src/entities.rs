@@ -128,6 +128,14 @@ pub struct Space {
     /// (sha256(deviceId ‖ NUL ‖ git_dir)) — diff grouping key for root sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkout_id: Option<String>,
+    /// Owner-stamped when git: identity shared by every clone and worktree of
+    /// one repository — its trunk's root commit (`commit:<sha>`, which
+    /// survives renames, transfers and remote spellings), else for a shallow
+    /// or empty history the normalized origin remote (`host/owner/repo`),
+    /// else `local:` + a device-scoped hash of the common git dir. Opaque to
+    /// readers: projects with equal ids group together.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_id: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -235,6 +243,12 @@ pub struct Chat {
 }
 
 impl Chat {
+    /// A session the user sees in chat lists: neither another chat's worker
+    /// (`parent_chat_id`) nor a hidden voice orchestrator.
+    pub fn is_top_level(&self) -> bool {
+        self.parent_chat_id.is_none() && !crate::voice::is_orchestrator_chat(&self.id)
+    }
+
     /// True when this chat syncs over the chat2 dumb relay.
     pub fn on_chat2(&self) -> bool {
         self.room_gen.unwrap_or(1) >= 2
@@ -302,6 +316,11 @@ pub struct Session {
     pub status: SessionStatus,
     pub started_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+    /// Subagents of this chat streaming right now. Rides the session row (and
+    /// its staleness window) so every device's sidebar can badge a chat it
+    /// has not opened; read it through `view::running_subagents`.
+    #[serde(default)]
+    pub running_subagents: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -205,6 +205,9 @@ impl Shell {
     /// Open a session from the sidebar: select it, the main area follows.
     pub(crate) fn open_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.command_palette = None;
+        // Opening any session steps the voice stage aside — including the one
+        // already selected under it. The call keeps running in the background.
+        self.set_voice_stage_open(false, cx);
         self.route = Route::Chat;
         self.focus_composer(cx);
         self.state
@@ -224,6 +227,7 @@ impl Shell {
     /// canvas on that project and wins over the sidebar filter.
     pub(super) fn open_new_session(&mut self, project: Option<String>, cx: &mut Context<Self>) {
         self.command_palette = None;
+        self.set_voice_stage_open(false, cx);
         self.route = Route::Chat;
         self.focus_composer(cx);
         // Pre-hide before the selection flips so the state change can't
@@ -401,6 +405,13 @@ impl Shell {
         let available_titlebar_width =
             (self.viewport_width - row_left - right_pad - trailing_width - row_gap * 3.0).max(0.0);
 
+        let running_subagents = {
+            let state = self.state.read(cx);
+            state
+                .selected_chat
+                .as_deref()
+                .map_or(0, |chat| state.running_subagents_for(chat, Utc::now()))
+        };
         let trailing: Option<gpui::AnyElement> = if on_canvas {
             None
         } else {
@@ -501,13 +512,31 @@ impl Shell {
                                 .aria_label(files_panel_label)
                                 .when(self.files_panel_open(cx), |button| {
                                     button.bg(crate::theme::wash(0.09))
+                                })
+                                // Running subagents live in this panel: mark the
+                                // button so they are findable while it is closed.
+                                .when(running_subagents > 0, |button| {
+                                    crate::running_pill::mark_files_button(
+                                        button,
+                                        running_subagents,
+                                        &theme,
+                                    )
                                 }),
                             )
-                            .child(header_icon_button(
+                            .child(header_icon_button_with(
                                 "toggle-changes",
-                                icons::SIDEBAR_MINIMALISTIC,
+                                icons::sidebar_glyph(
+                                    motion::state_t(
+                                        "toggle-changes",
+                                        right_pane_open,
+                                        motion::GLYPH_STATE,
+                                        self.reduced_motion,
+                                    ),
+                                    true,
+                                    16.0,
+                                    theme.text_muted,
+                                ),
                                 ShortcutId::ToggleChanges.label(),
-                                &theme,
                                 cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
                             )),
                     )
@@ -542,7 +571,7 @@ impl Shell {
                 .child(
                     header_icon_button(
                         "session-fork",
-                        icons::GIT_BRANCH,
+                        icons::FORK,
                         "Fork this session",
                         &theme,
                         cx.listener(|this, _, _, cx| this.create_side_chat(cx)),
