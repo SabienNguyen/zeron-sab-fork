@@ -12,7 +12,9 @@ mod client_ffi;
 pub mod layout;
 pub mod caption;
 pub mod orb;
+pub mod terminal;
 pub mod wallpaper;
+pub mod visual;
 
 /// Version handshake: the Swift/Kotlin bindings must match the linked library.
 #[uniffi::export]

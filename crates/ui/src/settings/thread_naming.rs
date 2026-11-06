@@ -7,6 +7,7 @@ use zeron_rpc::methods;
 
 use crate::pickers::{Pickers, TitleModelPicked};
 use crate::popover::Loadable;
+use crate::settings::search::{SearchAnchor, SettingId};
 use crate::settings::widgets;
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -101,6 +102,7 @@ impl ThreadNamingCard {
 
 impl Render for ThreadNamingCard {
     fn render(&mut self, _: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::toast::take_error(&mut self.error, cx);
         let theme = Theme::of(cx).for_settings_surface();
         let follows_session = self
             .settings
@@ -155,12 +157,8 @@ impl Render for ThreadNamingCard {
                                 vec![div().child(description).into_any_element()],
                             )),
                     )
-                    .child(control),
+                    .child(control)
+                    .search_anchor(SettingId::ThreadNaming),
             )
-            .when_some(self.error.clone(), |card, error| {
-                card.child(
-                    widgets::card_row(&theme, false).child(widgets::error_strip(&theme, error)),
-                )
-            })
     }
 }

@@ -28,42 +28,25 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=src/browser/linux/helper.c");
-    println!("cargo:rerun-if-changed=src/browser/linux/helper_wpe.c");
+    println!("cargo:rerun-if-changed=src/browser/linux/wpe.c");
+    println!("cargo:rerun-if-env-changed=ZERON_WPE");
+    println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
         return;
     }
+    build_wpe_helper();
     let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("zeron-webkit");
-    let pkg_config = |modules: &[&str]| {
-        Command::new("pkg-config")
-            .args(["--cflags", "--libs"])
-            .args(modules)
-            .output()
-            .expect("pkg-config is required to build the Linux browser helper")
-    };
-    // WPE WebKit lets the helper act as the display and set the frame rate;
-    // WebKitGTK renders offscreen at a fixed 60 Hz. Prefer WPE where its
-    // development files exist and fall back otherwise.
-    let wpe = pkg_config(&[
-        "wpe-webkit-2.0",
-        "wpe-platform-2.0",
-        "json-glib-1.0",
-        "xkbcommon",
-    ]);
-    let (engine, source, flags) = if wpe.status.success() {
-        ("WPE WebKit", "src/browser/linux/helper_wpe.c", wpe)
-    } else {
-        let gtk = pkg_config(&["webkit2gtk-4.1", "json-glib-1.0"]);
-        assert!(
-            gtk.status.success(),
-            "The Linux browser requires WPE WebKit (wpe-webkit-2.0, wpe-platform-2.0, \
-             xkbcommon) or WebKitGTK 4.1 (webkit2gtk-4.1), plus JSON-GLib (json-glib-1.0), \
-             with development files discoverable by pkg-config. \
-             See docs/reference/linux-browser.md for distribution-specific installation commands.\n{}",
-            String::from_utf8_lossy(&gtk.stderr)
-        );
-        ("WebKitGTK 4.1", "src/browser/linux/helper.c", gtk)
-    };
-    println!("cargo:rustc-env=ZERON_BROWSER_ENGINE={engine}");
+    let flags = Command::new("pkg-config")
+        .args(["--cflags", "--libs", "webkit2gtk-4.1", "json-glib-1.0"])
+        .output()
+        .expect("pkg-config is required to build the Linux browser helper");
+    assert!(
+        flags.status.success(),
+        "The Linux browser requires WebKitGTK 4.1 and JSON-GLib development files \
+         discoverable by pkg-config (webkit2gtk-4.1 and json-glib-1.0). \
+         See docs/reference/linux-browser.md for distribution-specific installation commands.\n{}",
+        String::from_utf8_lossy(&flags.stderr)
+    );
     let status = Command::new(env::var("CC").unwrap_or_else(|_| "cc".into()))
         .args([
             "-std=c11",
@@ -71,7 +54,7 @@ fn main() {
             "-Wall",
             "-Wextra",
             "-Wno-unused-parameter",
-            source,
+            "src/browser/linux/helper.c",
             "-o",
         ])
         .arg(&output)
@@ -79,4 +62,60 @@ fn main() {
         .status()
         .expect("C compiler is required to build the Linux browser helper");
     assert!(status.success(), "Linux browser helper compilation failed");
+}
+
+/// The WPE WebKit helper is optional: without WPE WebKit 2.50+ development
+/// files, with ones it does not compile against (an older GBM), or with
+/// `ZERON_WPE=0`, the build embeds an empty helper and the browser uses
+/// WebKitGTK.
+fn build_wpe_helper() {
+    let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("zeron-wpe");
+    let packages = [
+        "wpe-webkit-2.0 >= 2.50",
+        "wpe-platform-2.0",
+        "json-glib-1.0",
+        "gbm",
+        "egl",
+        "glesv2",
+        "xkbcommon",
+    ];
+    let flags = (env::var("ZERON_WPE").as_deref() != Ok("0"))
+        .then(|| {
+            Command::new("pkg-config")
+                .arg("--cflags")
+                .arg("--libs")
+                .args(packages)
+                .output()
+                .ok()
+        })
+        .flatten()
+        .filter(|flags| flags.status.success());
+    let Some(flags) = flags else {
+        println!(
+            "cargo:warning=WPE WebKit 2.50+ development files not found; the Linux browser will use WebKitGTK"
+        );
+        std::fs::write(&output, []).unwrap();
+        return;
+    };
+    let status = Command::new(env::var("CC").unwrap_or_else(|_| "cc".into()))
+        .args([
+            "-std=gnu11",
+            "-O2",
+            "-Wall",
+            "-Wextra",
+            "-Wno-unused-parameter",
+            "src/browser/linux/wpe.c",
+            "-o",
+        ])
+        .arg(&output)
+        .args(String::from_utf8(flags.stdout).unwrap().split_whitespace())
+        .arg("-lm")
+        .status()
+        .expect("C compiler is required to build the Linux browser helper");
+    if !status.success() {
+        println!(
+            "cargo:warning=WPE WebKit helper compilation failed; the Linux browser will use WebKitGTK"
+        );
+        std::fs::write(&output, []).unwrap();
+    }
 }

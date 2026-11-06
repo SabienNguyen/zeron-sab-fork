@@ -266,13 +266,17 @@ fn chat(id: &str, device_id: &str) -> Chat {
             reasoning: None,
             model_options: Default::default(),
             sandbox: SandboxLevel::WorkspaceWrite,
+            access: Default::default(),
+            plan: false,
         }),
         last_message_preview: None,
         last_message_at: None,
         created_at: ts(2_000),
         harness_session_id: None,
         harness_session_cwd: None,
+        harness_session_harness: None,
         parent_chat_id: Some("parent-chat".into()),
+        child_kind: None,
         space_id: None,
         last_seen_at: None,
         room_gen: None,
@@ -289,6 +293,8 @@ fn space(id: &str, device_id: &str, path: &str) -> Space {
         git_checked_at: None,
         checkout_id: None,
         repository_id: None,
+        github_repo: None,
+        icon: None,
         created_at: ts(1_500),
     }
 }
@@ -296,13 +302,84 @@ fn space(id: &str, device_id: &str, path: &str) -> Space {
 fn session(chat_id: &str, device_id: &str, status: SessionStatus) -> Session {
     Session {
         last_completed_turn: None,
+        last_turn_outcome: None,
+        terminal_activity: None,
         running_subagents: 0,
+        background_tasks: Vec::new(),
         chat_id: chat_id.into(),
         device_id: device_id.into(),
         status,
         started_at: Some(ts(3_000)),
         updated_at: ts(3_500),
     }
+}
+
+#[test]
+fn background_processes_replicate_and_clear() {
+    let mut host = RegistryDoc::new("host");
+    let mut viewer = RegistryDoc::new("viewer");
+    let mut row = session("chat", "host", SessionStatus::Idle);
+    row.background_tasks = vec![zeron_proto::BackgroundTask {
+        id: "bgsh".into(),
+        command: "npm run dev".into(),
+        description: Some("Start the dev server".into()),
+        started_at: ts(3_100),
+    }];
+    host.upsert_session(&row).unwrap();
+    let mut server = HashMap::new();
+    let mut seq = 0;
+    server_round(&mut server, &mut seq, &mut [&mut host, &mut viewer]);
+    assert_eq!(viewer.read_sessions().unwrap(), vec![row.clone()]);
+
+    // Every process ended: an empty list replaces the old one.
+    row.background_tasks.clear();
+    row.updated_at = ts(3_600);
+    host.upsert_session(&row).unwrap();
+    server_round(&mut server, &mut seq, &mut [&mut host, &mut viewer]);
+    assert_eq!(viewer.read_sessions().unwrap(), vec![row]);
+}
+
+#[test]
+fn program_activity_and_native_outcome_survive_replication_and_restart() {
+    use zeron_proto::{
+        DoneStatus, ProgramInputKind, ProgramState, ProgramStatus, TerminalActivity,
+    };
+    let now = ts(3_500);
+    let mut host = RegistryDoc::new("host");
+    let mut viewer = RegistryDoc::new("viewer");
+    let mut row = session("chat", "host", SessionStatus::Idle);
+    row.last_turn_outcome = Some(zeron_proto::NativeTurnOutcome {
+        status: DoneStatus::Interrupted,
+        finished_at: now,
+    });
+    row.terminal_activity = Some(TerminalActivity {
+        terminal_id: "pty".into(),
+        updated_at: ts(3_400),
+        report: ProgramStatus {
+            id: "worker".into(),
+            state: ProgramState::Blocked,
+            kind: Some(ProgramInputKind::Auth),
+            app: Some("demo".into()),
+            title: None,
+            message: Some("Sign in".into()),
+            progress: None,
+        },
+    });
+    host.upsert_session(&row).unwrap();
+    let mut server = HashMap::new();
+    let mut seq = 0;
+    server_round(&mut server, &mut seq, &mut [&mut host, &mut viewer]);
+    assert_eq!(viewer.read_sessions().unwrap(), vec![row.clone()]);
+    let restored = RegistryDoc::from_bytes(&viewer.to_bytes().unwrap(), "viewer").unwrap();
+    assert_eq!(restored.read_sessions().unwrap(), vec![row.clone()]);
+    row.terminal_activity = None;
+    row.last_turn_outcome = Some(zeron_proto::NativeTurnOutcome {
+        status: DoneStatus::Completed,
+        finished_at: now,
+    });
+    host.upsert_session(&row).unwrap();
+    server_round(&mut server, &mut seq, &mut [&mut host, &mut viewer]);
+    assert_eq!(viewer.read_sessions().unwrap(), vec![row]);
 }
 
 /// Stand-in for the server: applies every pushable batch from `docs` to a row
@@ -551,6 +628,43 @@ fn delete_chat_tombstones_row_and_session() {
 }
 
 #[test]
+fn a_space_icon_is_set_whole_survives_upserts_and_clears() {
+    use zeron_proto::SpaceIcon;
+    let mut ws = RegistryDoc::new("dev-a");
+    ws.upsert_space(&space("sp-1", "dev-a", "/home/u/project")).unwrap();
+    assert_eq!(ws.space("sp-1").unwrap().unwrap().icon, None);
+
+    let emoji = SpaceIcon { emoji: Some("🚀".into()), image: None, hue: Some("violet".into()) };
+    assert!(ws.set_space_icon("sp-1", Some(&emoji)).unwrap());
+    assert_eq!(ws.space("sp-1").unwrap().unwrap().icon, Some(emoji));
+
+    // Another kind replaces it whole: no emoji left beside the image.
+    let image = SpaceIcon { emoji: None, image: Some("https://edge.test/auth/avatars/ab".into()), hue: None };
+    assert!(ws.set_space_icon("sp-1", Some(&image)).unwrap());
+    assert_eq!(ws.space("sp-1").unwrap().unwrap().icon, Some(image.clone()));
+
+    // An upsert of the row without one (a re-seed, a create) leaves it.
+    ws.upsert_space(&space("sp-1", "dev-a", "/home/u/project")).unwrap();
+    assert_eq!(ws.space("sp-1").unwrap().unwrap().icon, Some(image));
+
+    assert!(ws.set_space_icon("sp-1", None).unwrap());
+    assert_eq!(ws.space("sp-1").unwrap().unwrap().icon, None);
+    assert!(!ws.set_space_icon("nope", None).unwrap());
+}
+
+#[test]
+fn a_malformed_space_icon_is_no_icon_not_a_lost_row() {
+    let mut ws = RegistryDoc::new("dev-a");
+    ws.upsert_space(&space("sp-1", "dev-a", "/home/u/project")).unwrap();
+    // (As a newer or broken writer might leave it.)
+    ws.write(KIND_SPACES, "sp-1", OpKind::Update, fields([("icon", json!("🚀"))]));
+    let row = ws.space("sp-1").unwrap().expect("the row stays");
+    assert_eq!(row.icon, None);
+    ws.write(KIND_SPACES, "sp-1", OpKind::Update, fields([("icon", json!({ "image": "file:///etc/passwd" }))]));
+    assert_eq!(ws.space("sp-1").unwrap().unwrap().icon, None);
+}
+
+#[test]
 fn spaces_round_trip_and_mutate() {
     let mut ws = RegistryDoc::new("dev-a");
     ws.upsert_space(&space("sp-1", "dev-a", "/home/u/project"))
@@ -573,6 +687,7 @@ fn spaces_round_trip_and_mutate() {
             true,
             Some("checkout-abc"),
             Some("github.com/owner/project"),
+            Some("acme/app"),
             ts(4_000),
         )
         .unwrap()
@@ -587,7 +702,10 @@ fn spaces_round_trip_and_mutate() {
     assert_eq!(row.git_checked_at, Some(ts(4_000)));
 
     assert!(!ws.rename_space("nope", Some("x")).unwrap());
-    assert!(!ws.set_space_git("nope", true, None, None, ts(1)).unwrap());
+    assert!(
+        !ws.set_space_git("nope", true, None, None, None, ts(1))
+            .unwrap()
+    );
 }
 
 #[test]
@@ -1253,6 +1371,145 @@ fn section_change(doc: &mut RegistryDoc, change: zeron_proto::SidebarSectionChan
 }
 
 #[test]
+fn sidebar_sections_keep_placed_order_across_devices() {
+    use zeron_proto::SidebarSectionChange::*;
+    let mut a = RegistryDoc::new("a");
+    let mut b = RegistryDoc::new("b");
+    let mut server = HashMap::new();
+    let mut seq = 0;
+    for id in ["one", "two", "three", "legacy"] {
+        a.upsert_chat(&chat(id, "desktop")).unwrap();
+    }
+    section_change(
+        &mut a,
+        Create {
+            id: "focus".into(),
+            name: "Focus".into(),
+        },
+    );
+    let place = |doc: &mut RegistryDoc, id: &str, after: Option<&str>, before: Option<&str>| {
+        section_change(
+            doc,
+            Assign {
+                session_id: id.into(),
+                section_id: Some("focus".into()),
+                after: after.map(Into::into),
+                before: before.map(Into::into),
+            },
+        )
+    };
+    let order = |doc: &RegistryDoc| {
+        doc.sidebar_preferences().unwrap().sections[0]
+            .session_ids
+            .clone()
+    };
+    // Anchorless assigns append, so membership no longer sorts by id.
+    place(&mut a, "two", None, None);
+    place(&mut a, "one", None, None);
+    assert_eq!(order(&a), ["two", "one"]);
+    // An engine that predates ordering writes a keyless member: it follows
+    // the placed ones until the next placement keys it in place.
+    a.write_sidebar_location("legacy", "focus");
+    assert_eq!(order(&a), ["two", "one", "legacy"]);
+    place(&mut a, "three", Some("two"), Some("one"));
+    assert_eq!(order(&a), ["two", "three", "one", "legacy"]);
+    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+    assert_eq!(order(&b), ["two", "three", "one", "legacy"]);
+    // A reorder on the other device converges back.
+    place(&mut b, "legacy", None, Some("two"));
+    server_round(&mut server, &mut seq, &mut [&mut b, &mut a]);
+    assert_eq!(order(&a), ["legacy", "two", "three", "one"]);
+    assert_eq!(order(&a), order(&b));
+    // A keyless move into another section never inherits the old key.
+    section_change(
+        &mut a,
+        Create {
+            id: "later".into(),
+            name: "Later".into(),
+        },
+    );
+    a.write_sidebar_location("one", "later");
+    assert_eq!(order(&a), ["legacy", "two", "three"]);
+}
+
+#[test]
+fn sidebar_sections_reorder_and_converge_across_devices() {
+    use zeron_proto::SidebarSectionChange::*;
+    let mut a = RegistryDoc::new("a");
+    let mut b = RegistryDoc::new("b");
+    let mut server = HashMap::new();
+    let mut seq = 0;
+    let create = |doc: &mut RegistryDoc, id: &str| {
+        section_change(
+            doc,
+            Create {
+                id: id.into(),
+                name: id.into(),
+            },
+        )
+    };
+    let moved = |doc: &mut RegistryDoc, id: &str, after: Option<&str>, before: Option<&str>| {
+        section_change(
+            doc,
+            Move {
+                id: id.into(),
+                after: after.map(Into::into),
+                before: before.map(Into::into),
+            },
+        )
+    };
+    let order = |doc: &RegistryDoc| {
+        doc.sidebar_preferences()
+            .unwrap()
+            .sections
+            .into_iter()
+            .map(|s| s.id)
+            .collect::<Vec<_>>()
+    };
+    for id in ["one", "two", "three"] {
+        create(&mut a, id);
+    }
+    // Unmoved sections keep creation order.
+    assert_eq!(order(&a), ["one", "two", "three"]);
+    moved(&mut a, "three", None, Some("one"));
+    assert_eq!(order(&a), ["three", "one", "two"]);
+    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+    assert_eq!(order(&b), ["three", "one", "two"]);
+    // A section created later, keyless as an older engine writes it, appends.
+    create(&mut b, "four");
+    assert_eq!(order(&b), ["three", "one", "two", "four"]);
+    // Concurrent moves of different sections both survive.
+    moved(&mut a, "one", Some("two"), None);
+    moved(&mut b, "four", None, Some("three"));
+    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+    assert_eq!(order(&a), order(&b));
+    assert_eq!(order(&a), ["four", "three", "two", "one"]);
+    // Concurrent moves of the same section: the later one wins everywhere.
+    moved(&mut a, "two", None, Some("four"));
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    moved(&mut b, "two", Some("one"), None);
+    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+    assert_eq!(order(&a), order(&b));
+    assert_eq!(order(&a), ["four", "three", "one", "two"]);
+    // Moving a deleted section is a no-op, and its anchors may be gone.
+    section_change(&mut a, Delete { id: "three".into() });
+    moved(&mut a, "three", None, Some("four"));
+    moved(&mut a, "one", Some("three"), None);
+    assert_eq!(order(&a), ["four", "two", "one"]);
+    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+    // Keying a new section leaves the keyed ones alone, so a concurrent
+    // move on another device survives a later move that keys it.
+    moved(&mut a, "one", None, Some("four"));
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    create(&mut b, "five");
+    moved(&mut b, "two", Some("five"), None);
+    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+    assert_eq!(order(&a), order(&b));
+    assert_eq!(order(&a), ["one", "four", "five", "two"]);
+}
+
+#[test]
 fn sidebar_sections_sync_metadata_membership_and_delete_without_deleting_sessions() {
     use zeron_proto::SidebarSectionChange::*;
     let mut a = RegistryDoc::new("a");
@@ -1272,6 +1529,8 @@ fn sidebar_sections_sync_metadata_membership_and_delete_without_deleting_session
         Assign {
             session_id: "session".into(),
             section_id: Some("focus".into()),
+            after: None,
+            before: None,
         },
     );
     server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
@@ -1335,6 +1594,8 @@ fn sidebar_sections_concurrent_pin_and_section_moves_converge() {
             Assign {
                 session_id: "session".into(),
                 section_id: Some("focus".into()),
+                after: None,
+                before: None,
             },
         );
         section_change(
@@ -1342,6 +1603,8 @@ fn sidebar_sections_concurrent_pin_and_section_moves_converge() {
             Assign {
                 session_id: "session".into(),
                 section_id: Some("later".into()),
+                after: None,
+                before: None,
             },
         );
         if reverse {
@@ -1370,6 +1633,8 @@ fn sidebar_sections_concurrent_pin_and_section_moves_converge() {
             Assign {
                 session_id: "session".into(),
                 section_id: Some("focus".into()),
+                after: None,
+                before: None,
             },
         );
         if reverse {
@@ -1417,6 +1682,8 @@ fn sidebar_sections_migration_is_replay_safe_and_preserves_newer_remote_intent()
         Assign {
             session_id: "session".into(),
             section_id: None,
+            after: None,
+            before: None,
         },
     );
     section_change(
@@ -1458,6 +1725,8 @@ fn sidebar_sections_honor_pin_toggles_from_older_clients() {
         Assign {
             session_id: "session".into(),
             section_id: Some("focus".into()),
+            after: None,
+            before: None,
         },
     );
     assert!(
@@ -1490,6 +1759,8 @@ fn sidebar_sections_honor_pin_toggles_from_older_clients() {
         Assign {
             session_id: "session".into(),
             section_id: Some("focus".into()),
+            after: None,
+            before: None,
         },
     );
     assert_eq!(
@@ -1526,6 +1797,36 @@ fn side_chat_origin_syncs_and_survives_updates_and_restart() {
             .parent_chat_id
             .as_deref(),
         Some("main")
+    );
+}
+
+#[test]
+fn a_child_kind_syncs_and_survives_updates_and_restart() {
+    let mut a = RegistryDoc::new("dev-a");
+    let mut b = RegistryDoc::new("dev-b");
+    let mut sub = chat("sub", "dev-a");
+    sub.parent_chat_id = Some("main".into());
+    sub.child_kind = Some(zeron_proto::ChildKind::Subagent);
+    a.upsert_chat(&sub).unwrap();
+    // A person's side chat records none.
+    let mut side = chat("side", "dev-a");
+    side.parent_chat_id = Some("main".into());
+    a.upsert_chat(&side).unwrap();
+    let mut server = HashMap::new();
+    let mut seq = 0;
+    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+    assert_eq!(b.chat("sub").unwrap(), Some(sub.clone()));
+    assert_eq!(b.chat("side").unwrap().unwrap().child_kind, None);
+    b.rename_chat("sub", "Survey the tests").unwrap();
+    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+    assert_eq!(
+        a.chat("sub").unwrap().unwrap().child_kind,
+        Some(zeron_proto::ChildKind::Subagent)
+    );
+    let restored = RegistryDoc::from_bytes(&a.to_bytes().unwrap(), "dev-a").unwrap();
+    assert_eq!(
+        restored.chat("sub").unwrap().unwrap().child_kind,
+        Some(zeron_proto::ChildKind::Subagent)
     );
 }
 
@@ -2146,4 +2447,28 @@ fn attaching_an_edge_after_local_only_writes_reseeds_them() {
     let mut doc = RegistryDoc::from_bytes(&doc.to_bytes().unwrap(), "dev-a").unwrap();
     doc.set_local_only(false);
     assert_eq!(doc.pending_len(), 0);
+}
+
+#[test]
+fn a_deleted_device_row_reads_as_deleted_not_unknown() {
+    let mut ws = RegistryDoc::new("dev-a");
+    ws.upsert_device(&device("laptop", "Laptop")).unwrap();
+    assert!(!ws.device_deleted("laptop"));
+    assert!(!ws.device_deleted("never-heard-of"));
+    // The edge tombstones a deleted Cloud session's device.
+    let _ = ws.apply_rows(
+        1,
+        vec![RegistryRow::tombstone(
+            KIND_DEVICES,
+            "cloud-1",
+            hlc_by(5_000, "cloud-edge"),
+        )],
+    );
+    assert!(ws.device_deleted("cloud-1"));
+    assert!(ws.read_devices().unwrap().iter().all(|d| d.id != "cloud-1"));
+    // A device that comes back revives its row.
+    let mut back = device("cloud-1", "Cloud session");
+    back.last_seen_at = Some(ts(9_000));
+    ws.upsert_device(&back).unwrap();
+    assert!(!ws.device_deleted("cloud-1"));
 }

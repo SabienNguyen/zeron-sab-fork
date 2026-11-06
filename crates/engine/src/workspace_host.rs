@@ -27,7 +27,8 @@ use chrono::Utc;
 use tokio::sync::watch;
 
 use zeron_doc::{DeletedSpace, REGISTRY_DOC_ID, RegistryDoc, WorkspaceDoc};
-use zeron_proto::{Chat, ChatConfig, Device, Session, SidebarPreferencesState, Space};
+use zeron_proto::projectless;
+use zeron_proto::{Chat, ChatConfig, Device, HarnessId, Session, SidebarPreferencesState, Space};
 use zeron_sync::{DocsStore, RegistryClient, RegistryTuning};
 
 use crate::doc_host::EdgeConfig;
@@ -137,6 +138,31 @@ pub(crate) fn join_retry_jitter() -> std::time::Duration {
     std::time::Duration::from_millis(u64::from(nanos) % 500)
 }
 
+/// A new projectless chat's cwd: the scratch folder the creating client
+/// already picked, else one named for the chat. Older clients send `~` (or
+/// nothing); new chats never run in the host's home.
+fn new_projectless_cwd(
+    chat_id: &str,
+    requested: Option<&str>,
+    created_at: chrono::DateTime<Utc>,
+) -> String {
+    match requested.map(str::trim) {
+        Some(cwd) if projectless::is_scratch_cwd(cwd) => cwd.to_string(),
+        _ => projectless::scratch_cwd(chat_id, created_at),
+    }
+}
+
+/// This device's advertised capabilities: the binary's, plus
+/// `cloud-session` on a Cloud session machine (device lists hide those and
+/// show the account's one Cloud device instead).
+fn device_capabilities() -> Vec<String> {
+    let mut capabilities = zeron_proto::capabilities::current();
+    if crate::runner::session().is_some() {
+        capabilities.push(zeron_proto::CLOUD_SESSION_CAPABILITY.to_string());
+    }
+    capabilities
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkspaceHostConfig {
     pub device_id: String,
@@ -178,6 +204,9 @@ struct WorkspaceHostInner {
     /// device's overlay back to its boot-time row `lastSeenAt` — an instant
     /// (and false) "offline" badge for a host that beat 20s ago.
     presence_seen: Mutex<std::collections::HashMap<String, i64>>,
+    /// Chats whose row this host claimed for a command that outran their
+    /// `createChat` ([`WorkspaceHost::claim_chat`]).
+    claimed: Mutex<std::collections::HashSet<String>>,
     /// Called with a device id whenever its presence heartbeat proves it alive —
     /// wired to `LinkCache::reset_cooldown` so a peer that comes back is dialed
     /// immediately instead of waiting out the failure backoff.
@@ -195,6 +224,18 @@ pub type PeerAliveHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A chat row's stored harness-native session (see
+/// [`WorkspaceHost::chat_harness_session`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredHarnessSession {
+    /// Empty = the "do not resume" tombstone.
+    pub session_id: String,
+    pub cwd: Option<String>,
+    /// The harness that minted `session_id`. `None` on rows that predate
+    /// the tag.
+    pub harness: Option<HarnessId>,
 }
 
 #[derive(Clone)]
@@ -286,7 +327,7 @@ impl WorkspaceHost {
             // on the Devices page; workspace version — same for every crate).
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
             cursor_sdk_version: Some(zeron_harness::CursorHarness::sdk_version().into()),
-            capabilities: zeron_proto::capabilities::current(),
+            capabilities: device_capabilities(),
         })?;
 
         let state = doc.read_all()?;
@@ -322,6 +363,7 @@ impl WorkspaceHost {
                 room: Mutex::new(None),
                 changed_tx,
                 presence_seen: Mutex::new(std::collections::HashMap::new()),
+                claimed: Mutex::default(),
                 peer_alive: Mutex::new(None),
                 presence_watch: Mutex::new(PresenceWatch::default()),
                 room_joined_at: std::sync::atomic::AtomicI64::new(0),
@@ -530,10 +572,16 @@ impl WorkspaceHost {
     /// down, relay fine: the 2026-08-18 03:45 incident shape) must never
     /// park the relay. Un-park is presence-driven: heartbeats resume → the
     /// verdict flips and the peer-alive hook clears any dial cooldown.
+    /// A deleted device row is positive evidence too: nothing answers there
+    /// (a deleted Cloud session's machine was still dialed every few seconds
+    /// by everything that targets its chat).
     pub fn peer_liveness(&self, device_id: &str) -> zeron_rpc::PeerLiveness {
         use zeron_rpc::PeerLiveness::{Dark, Live, Unknown};
         if device_id == self.inner.config.device_id {
             return Live;
+        }
+        if self.read(|doc| doc.device_deleted(device_id)) {
+            return Dark;
         }
         let now = now_ms();
         let (connected, live_beat) = {
@@ -638,6 +686,17 @@ impl WorkspaceHost {
         self.inner.config.edge.is_some()
     }
 
+    /// The edge this workspace syncs through (`None` = local/offline profile)
+    /// — also where account-scoped HTTP calls (Cloud, vault) go.
+    pub fn edge(&self) -> Option<&EdgeConfig> {
+        self.inner.config.edge.as_ref()
+    }
+
+    /// The workspace org (`ws3/{orgId}/…` rooms, `/cloud/{orgId}` routes).
+    pub fn org_id(&self) -> &str {
+        &self.inner.config.org_id
+    }
+
     // ── registry access helpers ─────────────────────────────────────────────
 
     /// Run a mutation under the registry lock, then wake the publish/persist
@@ -658,6 +717,14 @@ impl WorkspaceHost {
     /// The chat row as currently known (overlay view).
     pub fn chat(&self, chat_id: &str) -> Result<Option<Chat>, EngineError> {
         Ok(self.read(|doc| doc.chat(chat_id))?)
+    }
+
+    /// Whether `chat_id`'s parent is unknown here yet: this host claimed its
+    /// row for a command that arrived first ([`Self::claim_chat`]), and its
+    /// `createChat` hasn't landed ([`RegistryDoc::chat_parent_recorded`]).
+    pub fn parent_unknown(&self, chat_id: &str) -> bool {
+        lock(&self.inner.claimed).contains(chat_id)
+            && !self.read(|doc| doc.chat_parent_recorded(chat_id))
     }
 
     /// The space row as currently known (overlay view).
@@ -784,19 +851,24 @@ impl WorkspaceHost {
     /// older clocks — fields the claim never wrote (`config`, `title`) must
     /// still land then.
     ///
-    /// Resolve project cwd claims to a space. The portable home marker `~`
-    /// is the composer's projectless target; preserve it without minting a
-    /// project when the run outruns createChat on the registry channel.
+    /// Resolve project cwd claims to a space. A projectless target (`~` from
+    /// older clients, or a scratch folder) mints no project when the run
+    /// outruns createChat on the registry channel; the new row gets its own
+    /// scratch folder either way.
     pub fn claim_chat(&self, chat_id: &str, cwd: Option<&str>) -> Result<(), EngineError> {
         if self.read(|doc| doc.chat(chat_id))?.is_some() {
             return Ok(());
         }
-        let space_id = match cwd {
-            Some("~" | "~/") => None,
-            Some(cwd) => Some(self.space_for_path(cwd)?),
-            None => None,
+        let now = Utc::now();
+        let (cwd, space_id) = match cwd {
+            Some(cwd) if projectless::is_projectless_cwd(Some(cwd)) => {
+                (Some(new_projectless_cwd(chat_id, Some(cwd), now)), None)
+            }
+            Some(cwd) => (Some(cwd.to_string()), Some(self.space_for_path(cwd)?)),
+            None => (None, None),
         };
-        self.mutate(|doc| doc.claim_chat(chat_id, cwd, space_id.as_deref(), Utc::now()));
+        self.mutate(|doc| doc.claim_chat(chat_id, cwd.as_deref(), space_id.as_deref(), now));
+        lock(&self.inner.claimed).insert(chat_id.to_owned());
         Ok(())
     }
 
@@ -817,9 +889,10 @@ impl WorkspaceHost {
         }
         let root = linked_worktree_root(std::path::Path::new(path));
         if let Some(root) = root.as_deref()
-            && let Some(space) = spaces
-                .iter()
-                .find(|s| s.device_id == *device_id && s.path == root)
+            && let Some(space) = spaces.iter().find(|s| {
+                s.device_id == *device_id
+                    && (s.path == root || same_file::is_same_file(&s.path, root).unwrap_or(false))
+            })
         {
             return Ok(space.id.clone());
         }
@@ -832,6 +905,8 @@ impl WorkspaceHost {
             git_checked_at: None,
             checkout_id: None,
             repository_id: None,
+            github_repo: None,
+            icon: None,
             created_at: Utc::now(),
         };
         self.mutate(|doc| doc.upsert_space(&space))?;
@@ -855,6 +930,8 @@ impl WorkspaceHost {
     /// Sidebar freshness on message persist: preview = first 120 chars of the last
     /// message's text. Claims the row first so a pre-workspace chat gains one.
     pub fn note_message(&self, chat_id: &str, text: &str) {
+        // Annotation tokens carry their element as hex; previews read the label.
+        let text = zeron_proto::annotation::annotation_display(text);
         let preview: String = text.chars().take(120).collect();
         let result = self.claim_chat(chat_id, None).and_then(|_| {
             self.mutate(|doc| doc.set_chat_last_message(chat_id, &preview, Utc::now()))
@@ -869,8 +946,18 @@ impl WorkspaceHost {
     /// of its latest run and the cwd it was created under. An empty `session_id`
     /// tombstones the row ("do not resume" after a rejected resume). Best-effort:
     /// a missing chat row (claim happens on first command) just returns.
-    pub fn set_chat_harness_session(&self, chat_id: &str, session_id: &str, cwd: &str) {
-        match self.mutate(|doc| doc.set_chat_harness_session(chat_id, session_id, cwd)) {
+    ///
+    /// `harness` names the provider that minted `session_id`: an id is only
+    /// meaningful to that harness, and resume checks the tag.
+    pub fn set_chat_harness_session(
+        &self,
+        chat_id: &str,
+        session_id: &str,
+        cwd: &str,
+        harness: Option<HarnessId>,
+    ) {
+        let slug = harness.map(HarnessId::as_str);
+        match self.mutate(|doc| doc.set_chat_harness_session(chat_id, session_id, cwd, slug)) {
             Ok(_) => {}
             Err(err) => {
                 tracing::warn!(chat = %chat_id, error = %err, "registry harness-session write failed");
@@ -878,15 +965,22 @@ impl WorkspaceHost {
         }
     }
 
-    /// The chat row's stored harness session `(session_id, cwd)`, if stamped.
-    /// The empty-string tombstone passes through — callers must treat it as
-    /// "explicitly no resume" (and must NOT fall back to older sources).
-    pub fn chat_harness_session(&self, chat_id: &str) -> Option<(String, Option<String>)> {
+    /// The chat row's stored harness session, if stamped. The empty-string
+    /// tombstone passes through — callers must treat it as "explicitly no
+    /// resume" (and must NOT fall back to older sources).
+    pub fn chat_harness_session(&self, chat_id: &str) -> Option<StoredHarnessSession> {
         match self.read(|doc| doc.chat(chat_id)) {
             Ok(chat) => {
                 let chat = chat?;
                 let id = chat.harness_session_id?;
-                Some((id, chat.harness_session_cwd))
+                Some(StoredHarnessSession {
+                    session_id: id,
+                    cwd: chat.harness_session_cwd,
+                    harness: chat
+                        .harness_session_harness
+                        .as_deref()
+                        .and_then(HarnessId::from_slug),
+                })
             }
             Err(err) => {
                 tracing::warn!(chat = %chat_id, error = %err, "registry chat read failed");
@@ -908,7 +1002,8 @@ impl WorkspaceHost {
     /// Create a chat, usually *in a project*: the project fixes the host device
     /// and base cwd (`cwd` override = an isolated-worktree path). With no
     /// `space_id` the chat is project-less: `device_id` picks the host and the
-    /// cwd defaults to `~` (expanded host-side when the run spawns).
+    /// cwd defaults to the chat's own scratch folder (expanded and created
+    /// host-side when the run spawns).
     pub fn create_chat(
         &self,
         chat_id: &str,
@@ -931,6 +1026,35 @@ impl WorkspaceHost {
         cwd: Option<String>,
         parent_chat_id: Option<String>,
     ) -> Result<(), EngineError> {
+        self.create_chat_hosted(
+            chat_id,
+            space_id,
+            device_id,
+            None,
+            config,
+            cwd,
+            parent_chat_id,
+            None,
+        )
+    }
+
+    /// [`create_chat_with_parent`](Self::create_chat_with_parent) with an
+    /// explicit host: a chat run on Cloud is hosted by its session device,
+    /// not the device owning the project's folder, nor (for a side chat of a
+    /// Cloud chat with no project) the device that asked. `host: None` keeps
+    /// the project's owner, or the named device.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_chat_hosted(
+        &self,
+        chat_id: &str,
+        space_id: Option<&str>,
+        device_id: Option<&str>,
+        host: Option<&str>,
+        config: Option<ChatConfig>,
+        cwd: Option<String>,
+        parent_chat_id: Option<String>,
+        child_kind: Option<zeron_proto::ChildKind>,
+    ) -> Result<(), EngineError> {
         if self.read(|doc| doc.chat(chat_id))?.is_some() {
             return Ok(()); // idempotent: optimistic client retries never duplicate
         }
@@ -941,27 +1065,38 @@ impl WorkspaceHost {
             },
             None => None,
         };
-        let host_device = match (&space, device_id) {
-            (Some(space), _) => space.device_id.clone(),
-            (None, Some(device_id)) => device_id.to_string(),
-            (None, None) => {
+        let host_device = match (&space, device_id, host) {
+            // An explicit host always wins: a side chat of a Cloud chat runs
+            // on that machine, never on the computer that asked for it.
+            (_, _, Some(host)) => host.to_string(),
+            (Some(space), _, None) => space.device_id.clone(),
+            (None, Some(device_id), _) => device_id.to_string(),
+            (None, None, _) => {
                 return Err(EngineError::Other(
                     "createChat needs a spaceId or a deviceId".into(),
                 ));
             }
         };
+        let created_at = Utc::now();
+        let cwd = match &space {
+            Some(space) => cwd.unwrap_or_else(|| space.path.clone()),
+            None if projectless::is_projectless_cwd(cwd.as_deref()) => {
+                if self.hosts_scratch_folders(&host_device)? {
+                    new_projectless_cwd(chat_id, cwd.as_deref(), created_at)
+                } else {
+                    "~".to_string()
+                }
+            }
+            None => cwd.unwrap_or_default(),
+        };
+        let parent = parent_chat_id.filter(|p| !p.trim().is_empty());
         self.mutate(|doc| {
             doc.upsert_chat(&Chat {
                 id: chat_id.to_string(),
                 device_id: host_device.clone(),
                 title: None,
                 archived: false,
-                cwd: Some(cwd.unwrap_or_else(|| {
-                    space
-                        .as_ref()
-                        .map(|s| s.path.clone())
-                        .unwrap_or_else(|| "~".to_string())
-                })),
+                cwd: Some(cwd),
                 branch: None,
                 checkout_id: None,
                 source_context: None,
@@ -975,12 +1110,30 @@ impl WorkspaceHost {
                 // go through the seed+flip path (the host migration sweep).
                 room_gen: Some(2),
                 harness_session_cwd: None,
+                harness_session_harness: None,
                 space_id: space.as_ref().map(|s| s.id.clone()),
                 last_seen_at: None,
-                parent_chat_id: parent_chat_id.filter(|p| !p.trim().is_empty()),
+                // (What a child is to its parent: only a child has a kind.)
+                child_kind: child_kind.filter(|_| parent.is_some()),
+                parent_chat_id: parent,
             })
         })?;
         Ok(())
+    }
+
+    /// Whether `device_id` creates scratch folders for projectless chats: this
+    /// engine does; a peer must advertise it (older hosts only expand `~`).
+    fn hosts_scratch_folders(&self, device_id: &str) -> Result<bool, EngineError> {
+        if device_id == self.inner.config.device_id {
+            return Ok(true);
+        }
+        Ok(self.read_devices()?.iter().any(|device| {
+            device.id == device_id
+                && device
+                    .capabilities
+                    .iter()
+                    .any(|c| c == zeron_proto::capabilities::PROJECTLESS_SCRATCH_V1)
+        }))
     }
 
     // ── spaces (Mutate surface + owner stamps) ──────────────────────────────
@@ -1014,6 +1167,56 @@ impl WorkspaceHost {
                 git_checked_at: None,
                 checkout_id: None,
                 repository_id: None,
+                github_repo: None,
+                icon: None,
+                created_at: Utc::now(),
+            })
+        })?;
+        Ok(())
+    }
+
+    /// A project that lives only on Cloud: owned by the logical Cloud device
+    /// (which has no engine to stamp it), so its GitHub repository is set
+    /// here. Every session in it runs on a Cloud machine cloning that
+    /// repository. Idempotent like [`Self::create_space`]; also a no-op when
+    /// Cloud already has a project for the repository.
+    pub fn create_cloud_space(
+        &self,
+        space_id: &str,
+        device_id: &str,
+        path: &str,
+        name: Option<String>,
+        github_repo: &str,
+    ) -> Result<(), EngineError> {
+        if !device_id.starts_with(zeron_proto::CLOUD_DEVICE_PREFIX) {
+            return Err(EngineError::Other(
+                "Only Cloud projects name their repository.".into(),
+            ));
+        }
+        let spaces = self.read(|doc| doc.read_spaces())?;
+        if spaces.iter().any(|s| {
+            s.id == space_id
+                || (s.device_id == device_id
+                    && (s.path == path
+                        || s.github_repo
+                            .as_deref()
+                            .is_some_and(|repo| repo.eq_ignore_ascii_case(github_repo))))
+        }) {
+            return Ok(());
+        }
+        self.mutate(|doc| {
+            doc.upsert_space(&Space {
+                id: space_id.to_string(),
+                device_id: device_id.to_string(),
+                path: path.to_string(),
+                name,
+                git_detected: true,
+                git_checked_at: Some(Utc::now()),
+                checkout_id: None,
+                // Groups with the clones of the repository on other devices.
+                repository_id: Some(zeron_proto::view::cloud_repository_id(&spaces, github_repo)),
+                github_repo: Some(github_repo.to_string()),
+                icon: None,
                 created_at: Utc::now(),
             })
         })?;
@@ -1022,6 +1225,10 @@ impl WorkspaceHost {
 
     pub fn rename_space(&self, space_id: &str, name: Option<&str>) -> Result<bool, EngineError> {
         Ok(self.mutate(|doc| doc.rename_space(space_id, name))?)
+    }
+
+    pub fn set_space_icon(&self, space_id: &str, icon: Option<&zeron_proto::SpaceIcon>) -> Result<bool, EngineError> {
+        Ok(self.mutate(|doc| doc.set_space_icon(space_id, icon))?)
     }
 
     /// Hard-delete a space and its chats (registry cascade — one atomic batch).
@@ -1047,11 +1254,19 @@ impl WorkspaceHost {
         detected: bool,
         checkout_id: Option<&str>,
         repository_id: Option<&str>,
+        github_repo: Option<&str>,
     ) -> Result<bool, EngineError> {
         match self.read(|doc| doc.space(space_id))? {
             Some(space) if space.device_id == self.inner.config.device_id => {
                 Ok(self.mutate(|doc| {
-                    doc.set_space_git(space_id, detected, checkout_id, repository_id, Utc::now())
+                    doc.set_space_git(
+                        space_id,
+                        detected,
+                        checkout_id,
+                        repository_id,
+                        github_repo,
+                        Utc::now(),
+                    )
                 })?)
             }
             Some(space) => {
@@ -1063,6 +1278,55 @@ impl WorkspaceHost {
             }
             None => Ok(false),
         }
+    }
+
+    /// Cloud projects of `github_repo` that still carry another identity
+    /// than `repository_id` (a full clone's `commit:<root>`) take it, so they
+    /// group with this device's clone. Cloud projects have no engine of their
+    /// own to stamp them; only ever toward the commit form, so a shallow clone
+    /// elsewhere (remote form) can't flip them back. Returns how many moved.
+    pub fn align_cloud_spaces(
+        &self,
+        github_repo: &str,
+        repository_id: &str,
+    ) -> Result<usize, EngineError> {
+        if !repository_id.starts_with("commit:") || repository_id["commit:".len()..].contains(':') {
+            return Ok(0);
+        }
+        let stale: Vec<Space> = self
+            .read(|doc| doc.read_spaces())?
+            .into_iter()
+            .filter(|s| s.device_id.starts_with(zeron_proto::CLOUD_DEVICE_PREFIX))
+            .filter(|s| {
+                s.github_repo
+                    .as_deref()
+                    .is_some_and(|repo| repo.eq_ignore_ascii_case(github_repo))
+            })
+            .filter(|s| {
+                s.repository_id.as_deref() != Some(repository_id)
+                    && !s
+                        .repository_id
+                        .as_deref()
+                        .is_some_and(|id| id.starts_with("commit:"))
+            })
+            .collect();
+        if stale.is_empty() {
+            return Ok(0);
+        }
+        self.mutate(|doc| {
+            for space in &stale {
+                doc.set_space_git(
+                    &space.id,
+                    space.git_detected,
+                    space.checkout_id.as_deref(),
+                    Some(repository_id),
+                    space.github_repo.as_deref(),
+                    space.git_checked_at.unwrap_or_else(Utc::now),
+                )?;
+            }
+            Ok::<_, zeron_doc::DocError>(true)
+        })?;
+        Ok(stale.len())
     }
 
     pub fn read_spaces(&self) -> Result<Vec<Space>, EngineError> {
@@ -1206,9 +1470,13 @@ impl WorkspaceHostInner {
         let registry_synced = lock(&self.room)
             .as_ref()
             .is_some_and(|room| room.stats().synced);
+        // Sidebar pins are viewport state. A Cloud device has no viewport, and
+        // the edge refuses its writes to rows it doesn't own: reconciling here
+        // would rewrite the missing preferences row after every refused push.
+        let owns_sidebar = self.config.platform != zeron_proto::CLOUD_PLATFORM;
         let snapshot = {
             let mut doc = lock(&self.reg);
-            match doc.reconcile_sidebar_pins(registry_synced) {
+            match doc.reconcile_sidebar_pins(registry_synced && owns_sidebar) {
                 Ok(true) => {
                     // Persist and transmit cleanup just like a user mutation.
                     self.bump_changed();
@@ -1803,6 +2071,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_deleted_device_is_never_dialed() {
+        use super::*;
+
+        let dir = tempfile::tempdir().unwrap();
+        let host = WorkspaceHost::open(
+            Arc::new(DocsStore::open(dir.path()).unwrap()),
+            WorkspaceHostConfig {
+                device_id: "laptop".into(),
+                device_name: "Laptop".into(),
+                platform: "macos".into(),
+                org_id: "test-org".into(),
+                user_id: "test-user".into(),
+                edge: None,
+                local_only: false,
+            },
+        )
+        .unwrap();
+        // Unknown and room-less: ambiguous, never parked.
+        assert_eq!(
+            host.peer_liveness("cloud-1"),
+            zeron_rpc::PeerLiveness::Unknown
+        );
+        // The edge tombstones a deleted Cloud session's device: positive
+        // evidence that nothing answers, whatever the room's state.
+        let _ = lock(&host.inner.reg).apply_rows(
+            1,
+            vec![zeron_doc::RegistryRow {
+                kind: zeron_doc::KIND_DEVICES.into(),
+                id: "cloud-1".into(),
+                seq: 1,
+                deleted: true,
+                del_hlc: Some("0000000005000-000000-cloud-edge".into()),
+                fields: Default::default(),
+                clocks: Default::default(),
+            }],
+        );
+        assert_eq!(host.peer_liveness("cloud-1"), zeron_rpc::PeerLiveness::Dark);
+        assert_eq!(host.peer_liveness("laptop"), zeron_rpc::PeerLiveness::Live);
+    }
+
+    /// A claimed row doesn't know its parent until the chat's `createChat`
+    /// lands, which records `parentChatId` even when it has none; a row this
+    /// host never claimed always knows it.
+    #[tokio::test]
+    async fn a_claimed_chat_knows_its_parent_once_its_create_lands() {
+        use super::*;
+
+        let dir = tempfile::tempdir().unwrap();
+        let host = WorkspaceHost::open(
+            Arc::new(DocsStore::open(dir.path()).unwrap()),
+            WorkspaceHostConfig {
+                device_id: "test-device".into(),
+                device_name: "Test device".into(),
+                platform: "macos".into(),
+                org_id: "test-org".into(),
+                user_id: "test-user".into(),
+                edge: None,
+                local_only: false,
+            },
+        )
+        .unwrap();
+        host.create_chat("created", None, Some("test-device"), None, None)
+            .unwrap();
+        assert!(!host.parent_unknown("created"));
+
+        host.claim_chat("claimed", Some("/tmp")).unwrap();
+        assert!(host.parent_unknown("claimed"));
+        let mut chat = host.chat("claimed").unwrap().expect("the claimed row");
+        chat.parent_chat_id = None;
+        host.mutate(|doc| doc.upsert_chat(&chat)).unwrap();
+        assert!(!host.parent_unknown("claimed"));
+    }
+
+    #[tokio::test]
     async fn sidebar_preferences_watch_preserves_explicit_empty_state() {
         use super::*;
 
@@ -1904,7 +2246,10 @@ mod tests {
             last_completed_turn: None,
             started_at: None,
             updated_at: at,
+            last_turn_outcome: None,
+            terminal_activity: None,
             running_subagents: 0,
+            background_tasks: Vec::new(),
         }
     }
 

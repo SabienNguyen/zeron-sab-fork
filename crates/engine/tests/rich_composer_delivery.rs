@@ -156,9 +156,13 @@ fn request(prompt: &str) -> RunRequest {
         cwd: "/tmp".into(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
+        access: Default::default(),
+        plan: false,
         resume: None,
         attachments: vec![],
         worktree: None,
+        env: Default::default(),
+        extra_mcp: Vec::new(),
     }
 }
 fn rich_text(label: &str) -> (String, String) {
@@ -451,9 +455,20 @@ async fn projectless_catalogs_use_the_session_directory_and_reject_unknown_targe
             )
             .await
             .unwrap();
+        // A new chat's catalog comes from home; an existing projectless chat
+        // runs, and lists, from its own scratch folder.
         assert_eq!(
-            existing_chat, new_chat,
-            "projectless chat should use home: {method}"
+            new_chat[0]["description"],
+            std::env::var("HOME").unwrap(),
+            "{method}"
+        );
+        let chat_cwd = core.workspace.chat(CHAT).unwrap().unwrap().cwd.unwrap();
+        let name = chat_cwd.rsplit('/').next().unwrap();
+        let scratch = tmp.path().join("data").join("scratch").join(name);
+        assert_eq!(
+            existing_chat[0]["description"],
+            scratch.to_str().unwrap(),
+            "projectless chat should use its scratch folder: {method}"
         );
         assert!(
             client

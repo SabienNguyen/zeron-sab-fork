@@ -59,6 +59,8 @@ fn host_rows(now: chrono::DateTime<Utc>) -> (Device, Space, Chat) {
         git_checked_at: None,
         checkout_id: None,
         repository_id: None,
+        github_repo: None,
+        icon: None,
         created_at: now,
     };
     let chat = Chat {
@@ -83,16 +85,20 @@ fn host_rows(now: chrono::DateTime<Utc>) -> (Device, Space, Chat) {
             reasoning: None,
             model_options: Default::default(),
             sandbox: SandboxLevel::WorkspaceWrite,
+            access: Default::default(),
+            plan: false,
         }),
         last_message_preview: None,
         last_message_at: Some(now),
         created_at: now,
         harness_session_id: None,
         harness_session_cwd: None,
+        harness_session_harness: None,
         space_id: Some(SPACE.into()),
         last_seen_at: Some(now),
         room_gen: Some(2),
         parent_chat_id: None,
+        child_kind: None,
     };
     (device, space, chat)
 }
@@ -978,6 +984,8 @@ async fn immediate_exit_after_first_send_recovers_new_chat_on_each_host_platform
                     reasoning: None,
                     model_options: Default::default(),
                     sandbox: SandboxLevel::WorkspaceWrite,
+                    access: Default::default(),
+                    plan: false,
                 }),
                 branch: None,
                 cwd: None,
