@@ -114,6 +114,11 @@ function M.catalog(key: string?): Catalog?
 	return CATALOGS:get()[key]
 end
 
+-- The list kept for `key` now, not followed (a read ahead's check).
+function M.kept(key: string): Catalog?
+	return CATALOGS:peek()[key]
+end
+
 -- The composer's rows for a trigger's list (`/` the commands, `$` the
 -- skills): nil while the first read is on its way (the list shows its
 -- loading rows).

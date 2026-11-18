@@ -1,6 +1,7 @@
 -- The composer's `/` commands and `$` skills (screens/chat/invocations),
 -- on the chat page (ui/chat_fixture.luau, the host's list stubbed): each
--- list comes from the agent's, read as a `/` or `$` opens; it narrows as
+-- list comes from the agent's, read ahead once the chat has stayed chosen
+-- a moment and again as a `/` or `$` opens; it narrows as
 -- the name is typed; the agent's settings gate `$` and fold the skills
 -- into `/`; a pick lands as its token and goes out as its reference.
 
@@ -28,7 +29,8 @@ local PREFS = "screens/settings/prefs.luau::settings_skill_completion"
 
 test("`/` lists the agent's commands, read as it opens, narrowing as the name is typed", function()
 	local app = chat()
-	expect(reads(app)).to_be(0)
+	-- (Read ahead once already, as the chat settled: below.)
+	local ahead = reads(app)
 	app:type("role:textbox", "/")
 	settle(app)
 	expect(app:state("calls")).to_contain("invocations:claude-code:s2")
@@ -42,7 +44,7 @@ test("`/` lists the agent's commands, read as it opens, narrowing as the name is
 	expect(app:has('role:option "/review"')).to_be(true)
 	expect(app:has('role:option "/compact"')).to_be(false)
 	-- Typed further at, no new read: one per opening.
-	expect(reads(app)).to_be(1)
+	expect(reads(app)).to_be(ahead + 1)
 end)
 
 test("`$` lists the skills; with the agent's `$` off it's plain text, and with `/` not separate, `/` lists them too", function()
@@ -292,4 +294,58 @@ test("a trigger closed, deleted and typed again opens its list again", function(
 		settle(app)
 		expect(shown()).to_be(true)
 	end
+end)
+
+-- The list kept for a place (`<agent>|<device>|<place>`), if any.
+local function kept(app: any, place: string): any
+	for key, catalog in app:state("screens/chat/invocations.luau::chat_invocations") or {} do
+		if string.sub(key, -#place - 1) == `|{place}` then
+			return catalog
+		end
+	end
+	return nil
+end
+
+test("the agent's list is read ahead once the chat has stayed open a moment, so the first `/` opens on it", function()
+	local app = mount("chat_fixture.luau")
+	app:resize(900, 700)
+	app:command("go_s2")
+	-- (Not at once: an agent and a place stay chosen 250ms first.)
+	app:frames(5)
+	expect(reads(app)).to_be(0)
+	app:frames(20)
+	expect(reads(app)).to_be(1)
+	expect(app:state("calls")).to_contain("invocations:claude-code:s2")
+	local catalog = kept(app, "s2")
+	expect(catalog).never.to_be_nil()
+	expect(catalog.state).to_be("ready")
+	-- Staying, nothing is read again.
+	app:frames(60)
+	expect(reads(app)).to_be(1)
+	-- The first `/` shows the agent's commands, no loading rows first.
+	app:type("role:textbox", "/")
+	app:frames(2)
+	expect(app:has('role:option "/review"')).to_be(true)
+end)
+
+test("a chat left before the moment passes isn't read ahead; the one chosen is", function()
+	local app = mount("chat_fixture.luau")
+	app:resize(900, 700)
+	app:command("go_s2")
+	app:frames(5)
+	app:command("go_s3")
+	app:frames(40)
+	local calls = app:state("calls") or ""
+	expect(string.find(calls, "invocations:[%w%-]+:s2") == nil).to_be(true)
+	expect(string.find(calls, "invocations:[%w%-]+:s3") ~= nil).to_be(true)
+end)
+
+test("a chat whose device is out of reach isn't read ahead", function()
+	local app = mount("chat_fixture.luau")
+	app:resize(900, 700)
+	app:command("go_s2")
+	app:frames(2)
+	app:command("session_on_cloud")
+	app:frames(40)
+	expect(reads(app)).to_be(0)
 end)
