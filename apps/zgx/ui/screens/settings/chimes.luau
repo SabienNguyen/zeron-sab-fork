@@ -60,7 +60,7 @@ end
 
 local function play(ring: string?)
 	if ring and prefs.chimes(ring) then
-		host.invoke("sound.play", ring)
+		host.invoke("sound.play", prefs.sound_ask(ring))
 	end
 end
 

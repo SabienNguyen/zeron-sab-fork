@@ -3,7 +3,8 @@
 -- keeps posting them with the window closed), so their switches are its
 -- file's (`notifications.get`/`.set`, src/settings.rs); the session chimes
 -- are this app's (prefs.luau, played by chimes.luau). Each sub-setting
--- stays put while its parent is off, dimmed and out of reach.
+-- stays put while its parent is off, dimmed and out of reach. Each chime
+-- can be a file of the person's own, and heard with its banner (Test).
 
 local host = require("@app/screens/settings/host")
 local ds = require("@ds")
@@ -89,8 +90,128 @@ local function row(key: string, props: any): Node
 	return search.anchor(key, ds.Settings.Row(props))
 end
 
+-- The extensions a chime's own file may have on this computer (the host's
+-- `sound.formats`), once read: the picker's filter. Empty, unread: any file.
+local formats = ui.state("settings_sound_formats", {} :: { string })
+
+local function load_formats()
+	host.call("sound.formats"):after(function(v: any)
+		formats:set(if type(v) == "table" then v else {})
+	end, function() end)
+end
+
+-- A path's last part, its file's name.
+local function file_name(path: string): string
+	return string.match(path, "([^/\\]+)[/\\]?$") or path
+end
+
+local function t(key: string, args: any?): string
+	return ui.t(`settings.notifications.{key}`, args):get()
+end
+
+-- A chime's own file, chosen: kept unless the host says it isn't a sound
+-- played here (unasked, kept: the host plays the default in its place).
+local function choose(kind: string)
+	local f = formats:peek()
+	host.open_files({
+		title = t("sound_file.picker_title"),
+		filters = if #f > 0 then { { t("sound_file.filter"), f } } else nil,
+	}):after(function(files: { File })
+		local file = files and files[1]
+		if not file then
+			return
+		end
+		host.call("sound.check", { path = file.path }):after(function(word: any)
+			if word == "unsupported" then
+				local list = {}
+				for _, ext in formats:peek() do
+					table.insert(list, string.upper(ext))
+				end
+				toast.show {
+					title = t("sound_file.unsupported_title"),
+					body = if #list > 0 then t("sound_file.unsupported_body", { formats = table.concat(list, ", ") }) else nil,
+					tone = "warning",
+				}
+			else
+				prefs.set_sound_file(kind, file.path)
+			end
+		end, function()
+			prefs.set_sound_file(kind, file.path)
+		end)
+	end)
+end
+
+-- A chime heard as a session would ring it, with its banner when banners
+-- are on. Asked for, so its own switch and "only when in the background"
+-- don't hold it. A file of its own that's gone is said (the default plays).
+local function test(kind: string)
+	host.invoke("sound.play", prefs.sound_ask(kind))
+	if desktop:peek() then
+		host.invoke("notifications.test", { title = t("test_banner.title"), body = t(`test_banner.{kind}`) })
+	end
+	local path = prefs.sound_file(kind)
+	if path then
+		host.call("sound.check", { path = path }):after(function(word: any)
+			if word == "missing" then
+				toast.show { title = t("sound_file.missing_title", { file = file_name(path) }), body = t("sound_file.missing_body"), tone = "warning" }
+			end
+		end, function() end)
+	end
+end
+
+-- A chime's row: its own file's name under it (Reset at its end), Test and
+-- Choose… beside its switch.
+local function sound_row(kind: string): Node
+	local key = `sound_{kind}`
+	local function named(what: string): () -> string
+		return function(): string
+			return t(`sound_file.{what}_named`, { name = t(`{key}.name`) })
+		end
+	end
+	return under(prefs.sounds, key, {
+		label = ui.t(`settings.notifications.{key}.label`),
+		detail = function(): string?
+			local path = prefs.sound_file(kind)
+			return if path then file_name(path) else nil
+		end,
+		detail_action = ds.Button {
+			ui.t("settings.notifications.sound_file.reset"),
+			tone = "ghost",
+			size = "xs",
+			label = named("reset"),
+			on_click = function()
+				prefs.set_sound_file(kind, nil)
+			end,
+		},
+		control = ui.row {
+			gap = "$space.2",
+			items = "center",
+			ds.Button {
+				ui.t("settings.notifications.sound_file.test"),
+				tone = "ghost",
+				size = "sm",
+				label = named("test"),
+				on_click = function()
+					test(kind)
+				end,
+			},
+			ds.Button {
+				ui.t("settings.notifications.sound_file.choose"),
+				tone = "secondary",
+				size = "sm",
+				label = named("choose"),
+				on_click = function()
+					choose(kind)
+				end,
+			},
+			ds.Switch { value = prefs.sound(kind), label = ui.t(`settings.notifications.{key}.name`) },
+		},
+	})
+end
+
 function M.view(): Node
 	visits.once("notifications", load)
+	visits.once("notification_sounds", load_formats)
 	return ds.Settings.Page {
 		title = ui.t("settings.notifications.title"),
 		ds.Settings.Section {
@@ -133,18 +254,9 @@ function M.view(): Node
 					label = ui.t("settings.notifications.sounds.label"),
 					control = ds.Switch { value = prefs.sounds, label = ui.t("settings.notifications.sounds.label") },
 				}),
-				under(prefs.sounds, "sound_done", {
-					label = ui.t("settings.notifications.sound_done.label"),
-					control = ds.Switch { value = prefs.sound("done"), label = ui.t("settings.notifications.sound_done.name") },
-				}),
-				under(prefs.sounds, "sound_request", {
-					label = ui.t("settings.notifications.sound_request.label"),
-					control = ds.Switch { value = prefs.sound("request"), label = ui.t("settings.notifications.sound_request.name") },
-				}),
-				under(prefs.sounds, "sound_attention", {
-					label = ui.t("settings.notifications.sound_attention.label"),
-					control = ds.Switch { value = prefs.sound("attention"), label = ui.t("settings.notifications.sound_attention.name") },
-				}),
+				sound_row("done"),
+				sound_row("request"),
+				sound_row("attention"),
 			},
 		},
 	}

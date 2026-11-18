@@ -25,7 +25,8 @@ type SystemSoundId = u32;
 const PROPERTY_IS_UI_SOUND: u32 = u32::from_be_bytes(*b"isui");
 
 /// The longest a sound is waited for. Bounded so that a wedged sound server
-/// can't pile up threads; every sound zgx plays is about a second.
+/// can't pile up threads; every sound zgx plays is about a second, but for
+/// a chime's own file (Settings → Notifications), cut off here.
 const WAIT: Duration = Duration::from_secs(10);
 
 #[link(name = "AudioToolbox", kind = "framework")]
@@ -85,7 +86,9 @@ pub fn register(path: &Path) -> Result<SystemSound, String> {
 }
 
 impl SystemSound {
-    /// Plays it, and returns once it has played (or after `WAIT`).
+    /// Plays it, and returns once it has played, or after `WAIT`: played
+    /// too, as it sounded until then (a long file of the person's own), so
+    /// the default chime isn't played after it.
     pub fn play(&self) -> Result<(), String> {
         let (finished, wait) = mpsc::channel();
         let completion = ConcreteBlock::new(move || {
@@ -94,7 +97,8 @@ impl SystemSound {
         .copy();
         // SAFETY: the id is live; the server copies the block it keeps.
         unsafe { AudioServicesPlaySystemSoundWithCompletion(self.0, (&raw const *completion).cast()) };
-        wait.recv_timeout(WAIT).map_err(|_| "the system sound timed out".to_string())
+        let _ = wait.recv_timeout(WAIT);
+        Ok(())
     }
 }
 

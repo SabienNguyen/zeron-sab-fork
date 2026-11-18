@@ -33,6 +33,11 @@ local step_up_word = ui.state("settings_stub_step_up_word", "ok")
 -- The account's signing keys: "some" (this computer's, one new on another
 -- device, one revoked; listed out of order) or "none".
 local keys_mode = ui.state("settings_stub_keys", "some")
+-- The file the next pick answers with, when set (a path): else the app's
+-- PNG. And the sound files that are "there" for `sound.check`, by path.
+local picked = ui.state("settings_stub_picked", nil :: string?)
+local sounds_there = ui.state("settings_stub_sounds_there", {} :: { [string]: boolean })
+local SOUND_FORMATS = { "wav", "ogg", "oga", "flac", "mp3" }
 local signing_keys = {
 	{ key = "k_dev", fingerprint = "9f3a 21c0 77be 04d1 aa10 bb20 cc30 dd40", device_name = "dev", device_id = "d_dev", this_device = false, created_at = 1793600000 },
 	{ key = "k_old", fingerprint = "0b0b 1c1c 2d2d 3e3e 4f4f 5a5a 6b6b 7c7c", device_name = "old-laptop", device_id = "d_old", this_device = false, created_at = 1780000000, revoked_at = 1785000000 },
@@ -319,6 +324,17 @@ local answers: { [string]: (arg: any) -> any } = {
 		end
 		return r
 	end,
+	["sound.formats"] = function()
+		return settled(table.clone(SOUND_FORMATS))
+	end,
+	["sound.check"] = function(arg: any)
+		local path = tostring(arg.path or "")
+		local ext = string.lower(string.match(path, "%.([^./]+)$") or "")
+		if not table.find(SOUND_FORMATS, ext) then
+			return settled("unsupported")
+		end
+		return settled(if sounds_there:peek()[path] then "ok" else "missing")
+	end,
 	["agents.update"] = function()
 		return settled(nil)
 	end,
@@ -389,6 +405,11 @@ end
 -- A photo picked: the app's own PNG, so a headless host can draw it.
 stub.open_files = function(_opts: any): any
 	log("open_files")
+	local path = picked:peek()
+	if path then
+		local name = string.match(path, "([^/]+)$") or path
+		return settled({ { path = path, name = name, size = 1, type = "" } })
+	end
 	return settled({ { path = "assets/favicons/zeron.png", name = "zeron.png", size = 1, type = "image/png" } })
 end
 

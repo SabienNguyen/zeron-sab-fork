@@ -104,6 +104,31 @@ function M.chimes(kind: string): boolean
 	return M.sounds:peek() and one ~= nil and one:peek()
 end
 
+-- Each chime's own file, chosen in its place (by kind: a path on this
+-- computer). Kept where it is, not copied: one moved or deleted plays the
+-- default chime (the host's `custom_sound` says so).
+M.sound_files = ui.persist("settings_sound_files", {} :: { [string]: string })
+
+-- `kind`'s own file (`get`: followed as it changes), or nil.
+function M.sound_file(kind: string): string?
+	local path = M.sound_files:get()[kind]
+	return if path ~= nil and path ~= "" then path else nil
+end
+
+-- `kind`'s own file chosen, or (nil) back to the default chime.
+function M.set_sound_file(kind: string, path: string?)
+	local files = table.clone(M.sound_files:peek())
+	files[kind] = if path ~= "" then path else nil
+	M.sound_files:set(files)
+end
+
+-- What `sound.play` is asked for `kind`: the kind alone, or with its own
+-- file.
+function M.sound_ask(kind: string): any
+	local path = M.sound_files:peek()[kind]
+	return if path ~= nil and path ~= "" then { kind = kind, path = path } else kind
+end
+
 -- Each agent's completion in the composer (Zeron's Settings → Providers,
 -- settings/completion.rs): "Use $ for skills" (`$` opens the skills; off,
 -- it's ordinary text) and "Separate / commands" (skills kept out of the `/`

@@ -1422,6 +1422,26 @@
       "unread": {
         "title": "Couldn't read this computer's notification settings",
         "body": "Banners follow what Zeron last saved. Try again in a moment."
+      },
+      "sound_file": {
+        "test": "Test",
+        "test_named": "Test {name}",
+        "choose": "Choose…",
+        "choose_named": "Choose a file for {name}",
+        "reset": "Reset",
+        "reset_named": "Reset {name} to the default chime",
+        "picker_title": "Choose Sound",
+        "filter": "Sounds",
+        "unsupported_title": "That file can't be used as a sound",
+        "unsupported_body": "Choose one of: {formats}.",
+        "missing_title": "{file} can't be found",
+        "missing_body": "Playing the default chime instead."
+      },
+      "test_banner": {
+        "title": "Test notification",
+        "done": "Run finished",
+        "request": "Waiting on your input",
+        "attention": "Run failed"
       }
     },
     "files": {

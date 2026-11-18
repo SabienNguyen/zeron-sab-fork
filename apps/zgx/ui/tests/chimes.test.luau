@@ -112,3 +112,13 @@ test("chimes: Task completed off keeps done quiet, the rest still ring", functio
 	publish(app, { chat("a", "input", "t2") })
 	expect(table.concat(played(app), ",")).to_be("request")
 end)
+
+test("chimes: a chime with a file of its own asks for that file, the rest their kind", function()
+	local app = open({ chat("q", "working", "t1"), chat("f", "working", "t1") })
+	app:set_state("settings_sound_files", { request = "/sounds/ask.ogg" })
+	app:frames(2)
+	publish(app, { chat("q", "input", "t1"), chat("f", "working", "t1") })
+	publish(app, { chat("q", "input", "t1"), chat("f", "failed", "t1") })
+	-- (The stub logs a `{ kind, path }` ask by its path.)
+	expect(table.concat(played(app), ",")).to_be("/sounds/ask.ogg,attention")
+end)

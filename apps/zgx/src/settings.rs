@@ -62,7 +62,17 @@
 //!                                         methods (ENGINE_METHODS), its answer
 //!   notifications.get / .set({ desktop?, background_only?, agent_updates? })
 //!                                       the banners the engine posts
-//!   sound.play(kind)                    a chime: done, request, attention
+//!   notifications.test({ title, body }) a banner posted from here at once:
+//!                                       Settings' Test (whether banners are
+//!                                       on is the caller's to check)
+//!   sound.play(kind | { kind, path? })  a chime: done, request, attention;
+//!                                       `path` the person's own file for
+//!                                       it, the embedded chime if that one
+//!                                       is gone or not a sound played here
+//!   sound.formats                       { "wav", … }: the extensions a
+//!                                       chime's own file may have here
+//!   sound.check({ path })               what that file would come to: ok,
+//!                                       unsupported, missing
 //!   wallpaper.keep({ path })            a new chat's background image: a
 //!                                       copy of the picked file kept in the
 //!                                       engine's data folder (the shipping
@@ -285,14 +295,40 @@ pub fn install(_cx: &mut WindowContext, host: &ScriptHost) {
     });
     // A session's chime, the shipping app's own: "done", "request" (an
     // agent waiting on you) or "attention" (failed, or the connection gone).
-    host.action("sound.play", |kind| {
-        let data: &'static [u8] = match text(&kind).as_str() {
+    // Asked with the kind alone, or `{ kind, path }` for the person's own
+    // file for it (Settings → Notifications), which plays in its place when
+    // it's there and a sound this computer plays.
+    host.action("sound.play", |asked| {
+        let (kind, path) = match asked.field("kind") {
+            Some(kind) => (text(kind), asked.field("path").map(text)),
+            None => (text(&asked), None),
+        };
+        let data: &'static [u8] = match kind.as_str() {
             "done" => SOUND_DONE,
             "request" => SOUND_REQUEST,
             "attention" => SOUND_ATTENTION,
             _ => return,
         };
-        std::thread::spawn(move || play(data));
+        let own = custom_sound(path.as_deref());
+        std::thread::spawn(move || play_chime(data, own.as_deref()));
+    });
+    host.async_action("sound.formats", |_| async {
+        Ok(Value::List(SOUND_EXTENSIONS.iter().map(|ext| Value::from(*ext)).collect::<Vec<_>>().into()))
+    });
+    host.async_action("sound.check", |asked| {
+        let path = asked.field("path").map(text).unwrap_or_default();
+        async move { Ok(Value::from(sound_check(&path))) }
+    });
+    // Settings' Test: the banner a chime comes with, posted at once from
+    // this process. Asked for, so neither "only when in the background" nor
+    // the engine's pacing holds it (its `PostNotification` would); whether
+    // banners are on at all is the caller's to check.
+    host.action("notifications.test", |asked| {
+        let title = asked.field("title").map(text).unwrap_or_default();
+        let body = asked.field("body").map(text).unwrap_or_default();
+        if !title.is_empty() {
+            zeron_notify::post(&title, &body, None);
+        }
     });
     // A new chat's background image, as the shipping app keeps it
     // (settings.rs `install_new_thread_composer_background`): a copy of its
@@ -501,6 +537,112 @@ fn write_settings_at(path: &std::path::Path, changes: serde_json::Map<String, Js
     })
 }
 
+/// The extensions a chime's own file may have: what this computer's player
+/// decodes. The System Sound server takes Core Audio's files
+/// (src/system_sound.rs), `paplay` libsndfile's, `PlaySound` WAV alone.
+#[cfg(target_os = "macos")]
+const SOUND_EXTENSIONS: &[&str] = &["wav", "aiff", "aif", "caf"];
+#[cfg(windows)]
+const SOUND_EXTENSIONS: &[&str] = &["wav"];
+#[cfg(not(any(windows, target_os = "macos")))]
+const SOUND_EXTENSIONS: &[&str] = &["wav", "ogg", "oga", "flac", "mp3"];
+
+/// The person's own file for a chime, if it's one to play: an absolute
+/// path to a file that's there, of a kind [`SOUND_EXTENSIONS`] names.
+/// Otherwise none, and the embedded chime plays (a file moved or deleted,
+/// or chosen on another computer).
+fn custom_sound(path: Option<&str>) -> Option<std::path::PathBuf> {
+    let path = std::path::Path::new(path.filter(|p| !p.is_empty())?);
+    (sound_extension(path) && path.is_absolute() && path.is_file()).then(|| path.to_path_buf())
+}
+
+/// Whether `path` is named as a kind of sound this computer plays.
+fn sound_extension(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| SOUND_EXTENSIONS.iter().any(|known| ext.eq_ignore_ascii_case(known)))
+}
+
+/// What a chime's own file would come to (`sound.check`): "ok" (it plays),
+/// "unsupported" (not a kind of sound played here) or "missing" (not there:
+/// the default chime plays).
+fn sound_check(path: &str) -> &'static str {
+    if custom_sound(Some(path)).is_some() {
+        "ok"
+    } else if !sound_extension(std::path::Path::new(path)) {
+        "unsupported"
+    } else {
+        "missing"
+    }
+}
+
+/// A chime: the person's `own` file for it, or the embedded `data` if
+/// there's none or the player won't take it. Returns once it has played.
+fn play_chime(data: &[u8], own: Option<&std::path::Path>) {
+    if let Some(path) = own {
+        match play_path(path) {
+            Ok(()) => return,
+            Err(error) => eprintln!("zeron-zgx: sound: {}: {error}; the default chime instead", path.display()),
+        }
+    }
+    play(data);
+}
+
+/// A sound file as it is (never removed: it's the person's own). Returns
+/// once it has played, or been cut off at the time limit, which counts as
+/// played: it sounded until then, and the default isn't played after it.
+#[cfg(target_os = "macos")]
+fn play_path(path: &std::path::Path) -> Result<(), String> {
+    crate::system_sound::play_file(path)
+}
+
+#[cfg(windows)]
+fn play_path(path: &std::path::Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Media::Audio::{PlaySoundW, SND_FILENAME, SND_NODEFAULT, SND_SYNC};
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    // SAFETY: with SND_FILENAME the first argument is a NUL-terminated wide
+    // path, which `wide` keeps alive for the whole (synchronous) play.
+    let played = unsafe { PlaySoundW(wide.as_ptr(), std::ptr::null_mut(), SND_FILENAME | SND_SYNC | SND_NODEFAULT) };
+    if played != 0 { Ok(()) } else { Err("PlaySound refused it".to_string()) }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn play_path(path: &std::path::Path) -> Result<(), String> {
+    paplay(path)
+}
+
+/// The longest `paplay` plays: the System Sound server's bound
+/// (src/system_sound.rs `WAIT`), so a long file of the person's own ends.
+#[cfg(not(any(windows, target_os = "macos")))]
+const PLAY_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `path` through `paplay`, until it ends or [`PLAY_LIMIT`] (then stopped,
+/// and played). An error if it won't start or can't play the file.
+#[cfg(not(any(windows, target_os = "macos")))]
+fn paplay(path: &std::path::Path) -> Result<(), String> {
+    let mut child = std::process::Command::new("paplay")
+        .arg(path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|error| format!("paplay: {error}"))?;
+    let deadline = std::time::Instant::now() + PLAY_LIMIT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => return Err(format!("paplay: {status}")),
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(());
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+            Err(error) => return Err(format!("paplay: {error}")),
+        }
+    }
+}
+
 /// A chime, from a file of its own that goes once it has played: on macOS
 /// through the System Sound server (src/system_sound.rs says why not
 /// `afplay`), on Linux through `paplay`; on Windows, `PlaySound` straight
@@ -527,11 +669,7 @@ fn play_file(data: &[u8]) {
         eprintln!("zeron-zgx: sound: {error}");
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = std::process::Command::new("paplay")
-        .arg(&path)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    let _ = paplay(&path);
     let _ = std::fs::remove_file(&path);
 }
 
@@ -878,6 +1016,44 @@ mod tests {
                 .any(|entry| entry.file_name().to_string_lossy().starts_with(&prefix));
             assert!(!left, "the chime's file should be gone");
         }
+    }
+
+    // A chime's own file plays only when it's there and of a kind this
+    // computer plays; otherwise the embedded chime does.
+    #[test]
+    fn a_chimes_own_file_plays_only_if_its_there_and_a_sound() {
+        let dir = std::env::temp_dir().join(format!("zeron-zgx-custom-sound-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("Ding.WAV");
+        let text = dir.join("notes.txt");
+        std::fs::write(&wav, SOUND_DONE).unwrap();
+        std::fs::write(&text, b"not a sound").unwrap();
+        let wav_path = wav.to_str().unwrap();
+        assert_eq!(custom_sound(Some(wav_path)), Some(wav.clone()), "extensions in any case");
+        assert_eq!(custom_sound(Some(text.to_str().unwrap())), None, "not a sound");
+        assert_eq!(custom_sound(Some(dir.join("gone.wav").to_str().unwrap())), None, "gone");
+        assert_eq!(custom_sound(Some(dir.to_str().unwrap())), None, "a folder");
+        assert_eq!(custom_sound(Some("Ding.WAV")), None, "relative");
+        assert_eq!(custom_sound(Some("")), None);
+        assert_eq!(custom_sound(None), None);
+        assert_eq!(sound_check(wav_path), "ok");
+        assert_eq!(sound_check(text.to_str().unwrap()), "unsupported");
+        assert_eq!(sound_check(dir.join("gone.wav").to_str().unwrap()), "missing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A file paplay can't decode is an error, so the default chime plays in
+    // its place.
+    #[cfg(not(any(windows, target_os = "macos")))]
+    #[test]
+    fn paplay_refusing_a_file_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("zeron-zgx-bad-sound-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join("broken.wav");
+        std::fs::write(&bad, b"not really a wav").unwrap();
+        // (No paplay here is an error too: either way, not played.)
+        assert!(play_path(&bad).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -1422,6 +1422,26 @@
       "unread": {
         "title": "无法读取此电脑的通知设置",
         "body": "横幅使用 Zeron 上次保存的设置。请稍后重试。"
+      },
+      "sound_file": {
+        "test": "试听",
+        "test_named": "试听{name}",
+        "choose": "选择…",
+        "choose_named": "为{name}选择文件",
+        "reset": "重置",
+        "reset_named": "将{name}重置为默认提示音",
+        "picker_title": "选择声音",
+        "filter": "声音",
+        "unsupported_title": "该文件无法用作声音",
+        "unsupported_body": "请选择以下格式之一：{formats}。",
+        "missing_title": "找不到 {file}",
+        "missing_body": "将改为播放默认提示音。"
+      },
+      "test_banner": {
+        "title": "测试通知",
+        "done": "运行已完成",
+        "request": "正在等待你的输入",
+        "attention": "运行失败"
       }
     },
     "files": {
