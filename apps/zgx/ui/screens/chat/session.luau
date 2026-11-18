@@ -30,6 +30,11 @@ local pictures = ReplyImages.for_session(function(): any
 	local s = store.session:get()
 	return if s and s.state ~= "missing" then s else nil
 end)
+-- The pictures its agent's steps name, only inside the chat's folder.
+local step_pictures = ReplyImages.for_folder(function(): any
+	local s = store.session:get()
+	return if s and s.state ~= "missing" then s else nil
+end)
 -- The pictures sent with its messages: on another device, read from there.
 local sessions = require("@account/sessions")
 local sent_pictures = ReplyImages.for_attachments(function(): any
@@ -326,6 +331,7 @@ local function Session(id: Id?): Node
 						on_attach = shared.attach_quote,
 						pictures = pictures,
 						sent_pictures = sent_pictures,
+						step_pictures = step_pictures,
 						-- A subagent's spawn opens its lane, a panel tab
 						-- (the shipping app's `OpenSubagent`).
 						on_open_subagent = function(sub: any)

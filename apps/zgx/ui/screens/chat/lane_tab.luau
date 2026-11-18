@@ -1102,6 +1102,20 @@ M.Tab = ui.component(function(props: { tab: any }): Node
 		end
 		return { id = open.id, device = open.device, cwd = open.cwd, here = sessions.here:get() }
 	end)
+	-- The pictures its agent's steps name, only inside the chat's folder (a
+	-- subagent's lane: its parent's, as its tools' kept pictures are).
+	local step_pictures = ReplyImages.for_folder(function(): any
+		local s = lane_session()
+		if s then
+			return s
+		end
+		local parent = data.parent
+		local open = store.session:get()
+		if not parent or not open or open.id ~= parent or open.state == "missing" then
+			return nil
+		end
+		return open
+	end)
 	-- The session whose panel it's in (the page's): where a file it links
 	-- opens, and a subagent it spawned.
 	local function home_session(): string?
@@ -1213,6 +1227,7 @@ M.Tab = ui.component(function(props: { tab: any }): Node
 			else nil,
 		pictures = pictures,
 		sent_pictures = sent_pictures,
+		step_pictures = step_pictures,
 		on_open_subagent = function(sub: any)
 			local home = home_session()
 			if home then

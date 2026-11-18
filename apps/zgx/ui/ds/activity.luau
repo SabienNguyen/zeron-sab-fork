@@ -72,6 +72,10 @@ export type Tool = {
 	-- engine keeps them: copies on the chat's host, which the row opens to
 	-- (Zeron's chip previews, crates/ui tool_images.rs).
 	pictures: { { path: string, name: string? } }?,
+	-- The picture a Read or a Write named when its result kept none (an
+	-- older doc, a Write's): asked for only as a step's are (Props'
+	-- `step_pictures`, inside the chat's folder).
+	named_picture: { path: string, name: string? }?,
 }
 
 export type Writing = { words: (id: string) -> string?, seeded: () -> boolean }
@@ -96,6 +100,11 @@ export type Props = {
 	-- Where a tool's pictures are read from (ds/transcript's
 	-- `shown_pictures`: files on the chat's host). Without it, none show.
 	pictures: ReplyPicture.Pictures?,
+	-- What the pictures its steps name are (a thought's `![](path)`, the
+	-- file a Read or a Write named: ds/transcript's `step_pictures`, only
+	-- inside the chat's folder), each a thumbnail under its opened step.
+	-- Without it, none show.
+	step_pictures: ReplyPicture.Pictures?,
 	-- A thought being written: `words`, a thought's words as they arrive, by
 	-- its id (nil for one not being written: the reply's draft holds them,
 	-- so a tick of them doesn't build its rows again); `seeded`, whether what
@@ -257,17 +266,45 @@ local function tool_pictures(now: () -> Tool, shown: ReplyPicture.Pictures): Nod
 	return ReplyPicture.Thumbs { pictures = shown, items = entries, group = `tool:{now().id}`, set = entries }
 end
 
+-- The picture a Read or a Write named, kept none of (its `named_picture`),
+-- as a step's picture: only one `step` resolves (inside the chat's folder).
+local function named_entries(now: () -> Tool, step: ReplyPicture.Pictures?): { ReplyPicture.Entry }
+	local named = now().named_picture
+	if not step or not named or step.resolve(named.path) == nil then
+		return {}
+	end
+	return { { src = named.path, alt = named.name or "" } }
+end
+
 -- A row's call and what it did, as it opens (`row`): `now`, its tool;
 -- `pictures`, where its result's pictures are read from (without it, they
--- don't show).
-local Opened = ui.component(function(props: { now: () -> Tool, pictures: ReplyPicture.Pictures? }): Node
+-- don't show); `step`, where a picture its call only named is (without it,
+-- it doesn't show).
+local Opened = ui.component(function(props: { now: () -> Tool, pictures: ReplyPicture.Pictures?, step: ReplyPicture.Pictures? }): Node
 	local now = props.now
 	local pictures = props.pictures
+	local step = props.step
+	local function named(): { ReplyPicture.Entry }
+		return named_entries(now, step)
+	end
 	return ui.column {
 		w_full = true,
 		ui.show(function(): boolean
 			return now().call ~= nil
 		end, call_block(now)),
+		if step
+			then ui.show(
+				function(): boolean
+					return #named() > 0
+				end,
+				ui.div {
+					ml = ui.raw(GUTTER, "under the line's words, past the tree's gutter"),
+					mt = "$space.1",
+					mb = "$space.1",
+					ReplyPicture.Thumbs { pictures = step, items = named, group = `tool:{now().id}`, set = named },
+				}
+			)
+			else nil,
 		if pictures
 			then ui.show(
 				function(): boolean
@@ -424,12 +461,51 @@ local function gap_counter(): (text: string) -> number
 	end
 end
 
+-- Pictures one step shows, at most (the shipping chip's `MAX_CHIP_IMAGES`).
+local STEP_PICTURES = 4
+
+-- The pictures a thought's Markdown names (`![alt](src)`, `![alt](<src>)`)
+-- that `keep` says are ones to show (its step's: inside the chat's folder),
+-- each once, in order, at most four; none inside code (a fence, a span).
+local function thought_pictures(text: string, keep: (src: string) -> boolean): { ReplyPicture.Entry }
+	local out, seen = {}, {}
+	if not string.find(text, "![", 1, true) then
+		return out
+	end
+	local fenced: string? = nil
+	for line in string.gmatch(text, "[^\n]+") do
+		local fence = string.match(line, "^%s*(```+)") or string.match(line, "^%s*(~~~+)")
+		if fence then
+			if not fenced then
+				fenced = string.sub(fence, 1, 1)
+			elseif string.sub(fence, 1, 1) == fenced then
+				fenced = nil
+			end
+		elseif not fenced then
+			local plain = string.gsub(line, "`[^`]*`", "")
+			for alt, src in string.gmatch(plain, "!%[([^%]]*)%]%(%s*<?([^%s%)>]+)>?[^%)]*%)") do
+				if not seen[src] then
+					seen[src] = true
+					if keep(src) then
+						table.insert(out, { src = src, alt = alt })
+					end
+					if #out == STEP_PICTURES then
+						return out
+					end
+				end
+			end
+		end
+	end
+	return out
+end
+
 local function thought_row(
 	now: () -> Tool,
 	below: () -> boolean,
 	writing: Writing?,
 	group: string?,
-	resized: ((size: { w: number, h: number }) -> ())?
+	resized: ((size: { w: number, h: number }) -> ())?,
+	step: ReplyPicture.Pictures?
 ): Node
 	local id = now().id
 	local line = ui.theme.get("zeron.prose.small.line") :: number
@@ -491,6 +567,27 @@ local function thought_row(
 	end
 	local function label(): string
 		return if is_open() then locale.s("ds.activity.show_fewer_lines") else locale.s("ds.activity.show_all_lines", { n = tostring(lines()) })
+	end
+	-- Its pictures (the local ones its words name), as thumbnails under it
+	-- once it stands whole: opened, or measured and short enough not to
+	-- fold; not while it's still being written. A strip under the clip, not
+	-- pictures in the words, so the fold's lines stay the words' alone.
+	local pictures = ui.computed(function(): { ReplyPicture.Entry }
+		if not step or now().live then
+			return {}
+		end
+		return thought_pictures(words(), function(src: string): boolean
+			return step.resolve(src) ~= nil
+		end)
+	end)
+	local function shows_pictures(): boolean
+		if #pictures:get() == 0 then
+			return false
+		end
+		return is_open() or ((body.height or 0) > 0 and not long:get())
+	end
+	local function picture_list(): { ReplyPicture.Entry }
+		return pictures:get()
 	end
 	return ui.column {
 		w_full = true,
@@ -576,6 +673,19 @@ local function thought_row(
 				),
 			},
 		},
+		if step
+			then ui.show(
+				shows_pictures,
+				ui.div {
+					class = "thought-pictures",
+					w_full = true,
+					min_w = 0,
+					pl = ui.raw(GUTTER, "under the words, past the tree's gutter"),
+					pb = "$space.1",
+					ReplyPicture.Thumbs { pictures = step, items = picture_list, group = `thought:{group or ""}:{id}`, set = picture_list },
+				}
+			)
+			else nil,
 	}
 end
 
@@ -644,11 +754,12 @@ local function row(
 	group: string?,
 	resized: ((size: { w: number, h: number }) -> ())?,
 	settled: boolean?,
-	pictures: ReplyPicture.Pictures?
+	pictures: ReplyPicture.Pictures?,
+	step: ReplyPicture.Pictures?
 ): Node
 	local t = now()
 	if t.kind == "thought" then
-		return thought_row(now, below, writing, group, resized)
+		return thought_row(now, below, writing, group, resized, step)
 	end
 	local function tint(): string
 		return if now().failed then "$danger" else "$text.secondary"
@@ -665,7 +776,7 @@ local function row(
 	-- The pictures its result carried, where they can be read.
 	local function has_pictures(): boolean
 		local list = now().pictures
-		return pictures ~= nil and list ~= nil and #list > 0
+		return (pictures ~= nil and list ~= nil and #list > 0) or #named_entries(now, step) > 0
 	end
 	-- Open as the reader left it (opened or closed), else closed.
 	local function showing(): boolean
@@ -847,7 +958,7 @@ local function row(
 		},
 		-- What it opens to, made only once it's opened (a component's body
 		-- runs as it mounts: closed, nothing of it is made).
-		ui.show(showing, Opened { now = now, pictures = pictures }),
+		ui.show(showing, Opened { now = now, pictures = pictures, step = step }),
 	}
 end
 
@@ -1017,7 +1128,7 @@ return ui.component(function(props: Props): Node
 					return place() < last_branch:get()
 				end, function(): boolean
 					return live() and place() == count:get()
-				end, props.open_subagent, props.thought, props.key, resized, place() < count:peek(), props.pictures)
+				end, props.open_subagent, props.thought, props.key, resized, place() < count:peek(), props.pictures, props.step_pictures)
 			end
 			-- (A call arriving joins as a row joining a `ui.each` does; the rest
 			-- are made as they come into view, as they were.)

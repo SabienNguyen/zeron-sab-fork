@@ -47,6 +47,26 @@ function M.agent_of(chosen: string?, session: any): string?
 	return nil
 end
 
+-- How long an agent and a place stay chosen before their `/` and `$` list
+-- is read ahead (Zeron's composer.rs `SLASH_PREWARM_DELAY`).
+local PREFETCH_MS = 250
+
+-- Whether `target`'s device is one of yours out of reach now (the host
+-- says so), as a turn's line judges it: nothing there to ask.
+local function unreachable(target: Invocations.Target): boolean
+	local now = sessions.now:get()
+	local device = target.device
+	if not device or device == "" or device == now.here then
+		return false
+	end
+	for _, d in now.devices or {} do
+		if d.id == device then
+			return d.online == false
+		end
+	end
+	return false
+end
+
 export type Bind = {
 	key: string,
 	text: State<string>,
@@ -219,6 +239,34 @@ function M.bind(b: Bind): { [string]: any }
 		if key and harness and target then
 			Invocations.load(harness, target)
 		end
+	end)
+	-- The agent's list read ahead, so the first `/` or `$` opens on it rather
+	-- than on loading rows (Zeron's composer.rs `prewarm_slash`): once
+	-- an agent and a place have stayed chosen a moment (another chosen
+	-- meanwhile, the wait starts again), unless it's kept already or the
+	-- place's device is out of reach. A `/` typed first reads it itself; this
+	-- one then finds it on its way (`Invocations.load` reads once at a time).
+	-- (By its key alone: a chat's session changes as it streams, and each
+	-- change mustn't start the wait again.)
+	local ahead = ui.computed(function(): string?
+		local target = b.target()
+		if not target or unreachable(target) then
+			return nil
+		end
+		return invocation_key()
+	end)
+	ui.effect(function()
+		local key = ahead:get()
+		if not key then
+			return
+		end
+		-- (The wait belongs to this run: another agent or place stops it.)
+		ui.after(PREFETCH_MS, function()
+			local harness, target = b.agent(), b.target()
+			if harness and target and Invocations.key(harness, target) == key and Invocations.kept(key) == nil then
+				Invocations.load(harness, target)
+			end
+		end)
 	end)
 	-- What was last searched for: kept, so a reload doesn't search again.
 	local searched = ui.state(`{b.key}_mention_searched`, nil :: string?)
