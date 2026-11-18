@@ -328,6 +328,15 @@ ui.command {
 		tell({ { kind = "created", path = "docs/guide.md" }, { kind = "created", path = "shot.png" } })
 	end,
 }
+-- A page of HTML, its table of contents an anchor into it.
+ui.command {
+	id = "disk_html",
+	title = "A page of HTML",
+	run = function()
+		disk["docs/page.html"] = '<h1>Page</h1>\n<a href="#end">End</a>\n<p id="end">End</p>\n'
+		tell({ { kind = "created", path = "docs/page.html" } })
+	end,
+}
 -- Pictures made on another device: one that comes, one that can't.
 ui.command {
 	id = "disk_remote_images",

@@ -243,6 +243,7 @@
       "copy_path": "Copy Path",
       "reveal": "Reveal in Finder",
       "open_in_editor": "Open in Editor",
+      "open_in_browser_tab": "Open in Browser Tab",
       "find": "Find",
       "deleted_on_disk": "Deleted on disk",
       "changed_on_disk": "Changed on disk",
@@ -3360,6 +3361,7 @@
   },
   "files": {
     "name_fallback": "Files",
+    "html_preview": "Preview of {name}",
     "delete": {
       "title": "Delete for good?",
       "one": "“{name}” will be deleted from disk, not moved to the Trash. This can't be undone.",

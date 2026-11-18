@@ -43,6 +43,10 @@
 --                                 of the session's panel (the one already
 --                                 showing it, else a new one); nil: an
 --                                 empty browser tab (screens/panel/browser)
+--   Panel.open_document(session, path, text, project?)  an HTML file's text
+--                                 in a browser tab of the session's panel,
+--                                 its address the file's path (the one
+--                                 already showing that file, shown again)
 --   Panel.toggle_files()          ⌘E: the panel's Files tab in front, or closed
 --   Panel.toggle_terminal()       ⌘J: the same for a terminal
 --   Panel.step_tab(by)            ⌃Tab/⌃⇧Tab while the panel has the keyboard
@@ -146,6 +150,7 @@ type BrowserModule = {
 	has_keyboard: (tab: state.Tab) -> boolean,
 	open_find: (tab: state.Tab) -> (),
 	close: (tab: state.Tab) -> (),
+	show_document: (id: string, text: string) -> (),
 	Browser: (props: { key: string, tab: string, project: any?, session: any?, open_url: ((url: string) -> ())? }) -> Node,
 }
 local Browser: BrowserModule? = nil
@@ -549,6 +554,34 @@ function M.open_url(session: any, url: string?, project: any?, page: any?): bool
 	else
 		state.open(k, "browser", { url = url })
 	end
+	local set_files = (if shell_view then shell_view.set_files else nil) :: ((boolean) -> ())?
+	if set_files then
+		set_files(true)
+	end
+	return true
+end
+
+-- An HTML file's text (as typed, saved or not) in `session`'s panel: the
+-- browser tab already showing that file, its page made again from this
+-- text, else a new one. `path` is the file's (absolute where it's known):
+-- the tab's address and its key. Whether a tab took it.
+function M.open_document(session: any, path: string, text: string, project: any?): boolean
+	local k = state.key(session, project)
+	if not k or not Browser then
+		return false
+	end
+	local found: string? = nil
+	for _, t in state.of(k).tabs do
+		if t.kind == "browser" and t.doc == path then
+			found = t.id
+		end
+	end
+	if found then
+		state.activate(k, found)
+	else
+		found = state.open(k, "browser", { doc = path })
+	end
+	Browser.show_document(found :: string, text)
 	local set_files = (if shell_view then shell_view.set_files else nil) :: ((boolean) -> ())?
 	if set_files then
 		set_files(true)

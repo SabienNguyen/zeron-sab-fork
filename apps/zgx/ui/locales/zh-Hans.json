@@ -243,6 +243,7 @@
       "copy_path": "拷贝路径",
       "reveal": "在访达中显示",
       "open_in_editor": "在编辑器中打开",
+      "open_in_browser_tab": "在浏览器标签页中打开",
       "find": "查找",
       "deleted_on_disk": "已从磁盘删除",
       "changed_on_disk": "磁盘上的文件已更改",
@@ -3360,6 +3361,7 @@
   },
   "files": {
     "name_fallback": "文件",
+    "html_preview": "{name} 的预览",
     "delete": {
       "title": "永久删除？",
       "one": "“{name}”将从磁盘删除，而非移到废纸篓。此操作无法撤销。",
