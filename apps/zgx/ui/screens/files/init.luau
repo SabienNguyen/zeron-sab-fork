@@ -27,6 +27,7 @@ local comments = require("@app/screens/files/comments")
 local prefs = require("@app/screens/settings/prefs")
 local api = require("@app/screens/files/api")
 local paths = require("@app/screens/files/paths")
+local HtmlPreview = require("@app/screens/files/html_preview").HtmlPreview
 
 type Workspace = Workspace.Workspace
 type View = Workspace.View
@@ -79,6 +80,16 @@ local function add_to_chat_fn(): ((paths: { string }, root: string?) -> ())?
 	return nil
 end
 local add_to_chat = add_to_chat_fn()
+
+-- The session's panel (screens/panel), where a Browser tab opens: asked for
+-- as it's wanted (the panel requires this module as it loads), nil where
+-- it isn't (a fixture mounts files alone).
+local function panel(): any?
+	local ok, found = pcall(function(): any
+		return (require :: any)("@app/screens/panel")
+	end)
+	return if ok then found else nil
+end
 
 -- How big a file opens (the host's editable limit, as the shipping app).
 local LIMIT = 8 * 1024 * 1024
@@ -312,6 +323,21 @@ local function folder(w: Workspace, v: View, props: Props, here: () -> Where?): 
 	local function open_external(path: string)
 		Workspace.open_external(w, path)
 	end
+	-- A web address in a Browser tab of the session's panel.
+	local function open_url(url: string)
+		local p = panel()
+		if p and p.open_url then
+			p.open_url(w.target.chat, url, w.target.space)
+		end
+	end
+	-- Where a file is on disk, on this machine: its preview's base.
+	local function absolute(path: string): string?
+		local root = w.target.root
+		if not here() or not root then
+			return nil
+		end
+		return if string.sub(path, 1, 1) == "/" then path else `{root}/{path}`
+	end
 	local pane = FilesPane {
 		id = "files-pane",
 		hook = "files.pane",
@@ -485,6 +511,29 @@ local function folder(w: Workspace, v: View, props: Props, here: () -> Where?): 
 			-- its files: one opens here, a folder shows in the tree.
 			picture = function(path: string, src: string): string?
 				return Workspace.picture(w, path, src)
+			end,
+			-- An HTML file's page, from what's typed (screens/files/
+			-- html_preview), its pictures and styles beside it on this
+			-- machine; web links in it go to a Browser tab.
+			html_view = function(path: string, text: () -> string): Node
+				return HtmlPreview {
+					view = v.id,
+					path = path,
+					absolute = function(): string?
+						return absolute(path)
+					end,
+					text = text,
+					open_url = open_url,
+				}
+			end,
+			-- The same in a Browser tab of the session's panel, by the
+			-- file (the one showing it already is shown again): its address
+			-- is the file's.
+			on_open_html = function(path: string, text: string)
+				local p = panel()
+				if p and p.open_document then
+					p.open_document(w.target.chat, (if w.target.root then `{w.target.root}/{path}` else path), text, w.target.space)
+				end
 			end,
 			on_link = function(path: string, target: string)
 				local to = Workspace.relative(path, target)

@@ -122,6 +122,12 @@ local function fake_web(id: string): any
 			fields.title:set(`Page at {string.match(url, "^%a+://([^/]+)") or url}`)
 			fields.can_go_back:set(true)
 		end,
+		-- A page of HTML: its base (else about:blank) its address, its words
+		-- (`html:<base>:<length>`) noted.
+		html = function(_self: any, html: string, base: string?)
+			web_note(`html:{base or ""}:{#html}`)
+			fields.url:set(base or "about:blank")
+		end,
 		back = function()
 			web_note("back")
 		end,

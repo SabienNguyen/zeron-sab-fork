@@ -13,8 +13,9 @@
 -- leading, as the git pages' file cards), stand beside it for comparison.
 -- What stays at any width: Save, while there is something to save, Find,
 -- the switch a file's kind needs (Preview and Source; an image's zoom,
--- down to its level), and the menu, which holds everything else. At 440
--- points Wrap comes out of the menu, at 640 Copy Path, Reveal and Open.
+-- down to its level; an HTML file's Browser tab), and the menu, which
+-- holds everything else. At 440 points Wrap comes out of the menu, at 640
+-- Copy Path, Reveal and Open.
 --
 -- Under the header, the file:
 --
@@ -24,6 +25,9 @@
 --   changes on disk under unsaved edits, a banner asks which to keep.
 -- - Markdown, set for reading (the transcript's markdown), or its source to
 --   edit; what is typed shows in the preview.
+-- - HTML, given a page to show it in (`html_view`), the same: the page as a
+--   browser draws it, or its source; and, with `on_open_html`, a globe that
+--   shows it in a Browser tab, unsaved edits and all.
 -- - An image, fitted (never past its own size), over a checkerboard where
 --   it's transparent. ⌘+ ⌘− zoom, ⌘0 fits, ⌘1 is its own size; a pinch or
 --   ⌘-scroll zooms about the pointer; scrolling pans; a double click
@@ -133,6 +137,12 @@ export type Props = {
 	-- alt text and such links only styled.
 	picture: ((path: string, src: string) -> string?)?,
 	on_link: ((path: string, target: string) -> ())?,
+	-- An HTML file's page: the caller's web view of the file at `path`, its
+	-- text as typed (read as it changes). Without it, HTML is code.
+	html_view: ((path: string, text: () -> string) -> Node)?,
+	-- An HTML file shown in a Browser tab, from its text as typed: what
+	-- isn't saved yet shows too.
+	on_open_html: ((path: string, text: string) -> ())?,
 	readonly: boolean?,
 	-- What stands between a code file's lines (`ds/code_editor`'s).
 	blocks: any?,
@@ -243,6 +253,10 @@ end
 local function is_markdown(path: string): boolean
 	local e = ext(path)
 	return e == "md" or e == "markdown" or e == "mdx"
+end
+local function is_html(path: string): boolean
+	local e = ext(path)
+	return e == "html" or e == "htm"
 end
 local function lines_in(text: string): number
 	local _, n = string.gsub(text, "\n", "")
@@ -718,6 +732,9 @@ local function component(props: Props): Node
 		if is_markdown(d.path) then
 			return "markdown"
 		end
+		if props.html_view and is_html(d.path) then
+			return "html"
+		end
 		return "code"
 	end
 	-- The editor's text follows the doc. Another file: what was typed here
@@ -1113,7 +1130,20 @@ local function component(props: Props): Node
 	end
 	local function editing(): boolean
 		local k = kind()
-		return k == "code" or (k == "markdown" and not rendered:get())
+		return k == "code" or ((k == "markdown" or k == "html") and not rendered:get())
+	end
+	-- An HTML file, page or source (or code, with no page to show it in):
+	-- what a Browser tab can show.
+	local function html_file(): boolean
+		local d = doc()
+		local k = kind()
+		return d ~= nil and (k == "html" or k == "code") and is_html(d.path)
+	end
+	local function open_html()
+		local d = doc_peek()
+		if d and props.on_open_html then
+			props.on_open_html(d.path, text:peek())
+		end
 	end
 	local function zoom(name: string): () -> ()
 		return function()
@@ -1443,14 +1473,17 @@ local function component(props: Props): Node
 			ui.show(editing, ui.row {
 				gap = "$zeron.space.hair",
 				mr = function(): any
-					return if shows({ "markdown" })() then "$space.1" else 0
+					return if shows({ "markdown", "html" })() then "$space.1" else 0
 				end,
 				toggle("ds.file_viewer.find", "search", find_open, "cmd+f"),
 				ui.show(function(): boolean
 					return room() >= ROOM_TOOLS
 				end, toggle("ds.file_viewer.wrap_lines", "wrap-text", wrap, "alt+z")),
 			}),
-			ui.show(shows({ "markdown" }), source_switch()),
+			ui.show(shows({ "markdown", "html" }), source_switch()),
+			-- (An HTML file in a Browser tab: at any width, the one way to run
+			-- what its page does beyond a preview.)
+			if props.on_open_html then ui.show(html_file, action("ds.file_viewer.open_in_browser_tab", "global", open_html)) else nil,
 			ui.show(shows({ "image" }), zoom_controls()),
 			ui.show(function(): boolean
 				return has_file() and room() >= ROOM_ALL
@@ -1742,6 +1775,23 @@ local function component(props: Props): Node
 				mode = "wait",
 			})
 		end
+		if k == "html" then
+			local view = props.html_view :: (string, () -> string) -> Node
+			return ui.presence(rendered, function(on: boolean): Node
+				if on then
+					return view(doc_.path, function(): string
+						return text:get()
+					end)
+				end
+				return code(language, doc_.path)
+			end, {
+				w_full = true,
+				h_full = true,
+				enter = Motion.transition({ opacity = { 0, 1 }, duration = 140 }),
+				exit = Motion.transition({ opacity = 0, duration = 80 }),
+				mode = "wait",
+			})
+		end
 		return code(language, doc_.path)
 	end, {
 		w_full = true,
@@ -1776,7 +1826,7 @@ local function component(props: Props): Node
 						table.insert(parts, `{d.width} × {d.height}`)
 					end
 					table.insert(parts, string.upper(ext(d.path)))
-				elseif k == "code" or k == "markdown" then
+				elseif k == "code" or k == "markdown" or k == "html" then
 					local lang = Syntax.name(Syntax.language(d.path))
 					if lang ~= "" then
 						table.insert(parts, lang)
@@ -1802,7 +1852,7 @@ local function component(props: Props): Node
 
 	local box: { [any]: any } = {}
 	for k, v in props do
-		if k ~= "doc" and k ~= "root" and k ~= "limit" and k ~= "readonly" and k ~= "blocks" and k ~= "block_view" and k ~= "head" and k ~= "lead" and k ~= "hooks" and k ~= "drafts" and k ~= "places" and k ~= "openable" and k ~= "more_menu" and k ~= "wrap_default" and k ~= "autosave" and k ~= "code_size" and k ~= "picture" and k ~= "reveal_line" and k ~= "escape_hint" and string.sub(tostring(k), 1, 3) ~= "on_" and k ~= "children" then
+		if k ~= "doc" and k ~= "root" and k ~= "limit" and k ~= "readonly" and k ~= "blocks" and k ~= "block_view" and k ~= "head" and k ~= "lead" and k ~= "hooks" and k ~= "drafts" and k ~= "places" and k ~= "openable" and k ~= "more_menu" and k ~= "wrap_default" and k ~= "autosave" and k ~= "code_size" and k ~= "picture" and k ~= "html_view" and k ~= "reveal_line" and k ~= "escape_hint" and string.sub(tostring(k), 1, 3) ~= "on_" and k ~= "children" then
 			box[k] = v
 		end
 	end
@@ -1813,7 +1863,7 @@ local function component(props: Props): Node
 	box[#box + 1] = body
 	box[#box + 1] = ui.show(function(): boolean
 		local k = kind()
-		return k == "image" or (k == "markdown" and rendered:get())
+		return k == "image" or ((k == "markdown" or k == "html") and rendered:get())
 	end, foot)
 	return ui.column(box)
 end

@@ -200,6 +200,7 @@ return {
 	["ds.file_viewer.copy_path"] = "Copy Path",
 	["ds.file_viewer.reveal"] = "Reveal in Finder",
 	["ds.file_viewer.open_in_editor"] = "Open in Editor",
+	["ds.file_viewer.open_in_browser_tab"] = "Open in Browser Tab",
 	["ds.file_viewer.find"] = "Find",
 	["ds.file_viewer.deleted_on_disk"] = "Deleted on disk",
 	["ds.file_viewer.changed_on_disk"] = "Changed on disk",

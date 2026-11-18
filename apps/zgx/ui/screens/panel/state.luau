@@ -26,6 +26,9 @@ export type Tab = {
 	-- A browser tab's address, as it was last navigated (its page lives in
 	-- the host by the tab's id, screens/panel/browser).
 	url: string?,
+	-- A browser tab showing a file's text (an HTML file, screens/files): the
+	-- file, by which the tab is found again, and what its address says.
+	doc: string?,
 	-- A terminal's number, for its title ("Terminal 2"); the engine's
 	-- terminal it shows, on which device, and the command zgx runs for it.
 	n: number?,
@@ -176,6 +179,7 @@ function M.open(key: string, kind: Kind, extra: { [string]: any }?): string
 	end
 	if kind == "browser" and extra then
 		tab.url = extra.url
+		tab.doc = extra.doc
 	end
 	if (kind == "side_chat" or kind == "subagent") and extra then
 		tab.chat, tab.title, tab.data = extra.chat, extra.title, extra.data

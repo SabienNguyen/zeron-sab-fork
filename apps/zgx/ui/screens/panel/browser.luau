@@ -18,9 +18,16 @@
 -- rides with the tab (screens/panel/state), so a tab made again from a
 -- saved panel loads where it left off.
 --
+-- A tab can show a file's text instead (an HTML file, Panel.open_document):
+-- the page is that text, as typed, under about:blank, and its address and
+-- name are the file's. The browser is never given a file's address, so
+-- what the page names beside it doesn't load; the web's does. Its anchors
+-- (about:blank#…) stay on it, and Reload makes it again from the text.
+--
 --   Browser.Browser { key, tab, project, session, open_url }
---   Browser.title(tab)        the page's title, else its host
+--   Browser.title(tab)        the page's title, else its host (a file's name)
 --   Browser.close(tab)        the tab's page let go
+--   Browser.show_document(id, text)  tab `id`'s file's text, shown (again)
 
 local ds = require("@ds")
 local Icon = require("@ds/icon")
@@ -254,15 +261,40 @@ function M.open_settings(page: string?)
 	end)
 end
 
+-- The text each file's tab shows, by tab id, and a count that moves with
+-- each showing: kept, so a page made again (a reload of the scripts whose
+-- page the host let go, another account's) is made from it.
+local documents = ui.state("panel_browser_documents", {} :: { [string]: { text: string, n: number } })
+-- Which showing each tab's page has (this run's): one shown again moves on.
+local shown_documents: { [string]: number } = {}
+-- The pages showing a file's text: theirs is about:blank.
+local document_pages: { [any]: boolean } = setmetatable({}, { __mode = "k" }) :: any
+
+-- A file's text's address, its anchors' too.
+local function is_document(u: string): boolean
+	return u == "about:blank" or string.sub(u, 1, 12) == "about:blank#"
+end
+
 local function has_page(web: any): boolean
 	local u = web.url
-	return type(u) == "string" and u ~= "" and u ~= "about:blank"
+	if type(u) ~= "string" or u == "" then
+		return false
+	end
+	return not is_document(u) or document_pages[web] == true
+end
+
+function M.show_document(id: string, text: string)
+	local was = documents:peek()[id]
+	documents:set_key(id, { text = text, n = (if was then was.n else 0) + 1 })
 end
 
 function M.title(tab: Tab): string?
 	local t = titles:get()[tab.id]
 	if t and t ~= "" then
 		return t
+	end
+	if tab.doc then
+		return string.match(tab.doc, "[^/]+$") or tab.doc
 	end
 	return api.host_of(tab.url)
 end
@@ -281,6 +313,8 @@ function M.close(tab: Tab)
 	last_chips:set_key(tab.id, nil)
 	session_picks:set_key(tab.id, nil)
 	marked:set_key(tab.id, nil)
+	documents:set_key(tab.id, nil)
+	shown_documents[tab.id] = nil
 end
 
 -- A prop's value now: a function's answer, a state's value (tracked), or
@@ -423,8 +457,14 @@ Page = ui.component(function(props: Props): Node
 	end
 	local t0 = tab()
 	local web = page_for(id, profile)
+	-- A file's tab: the file, its address.
+	local doc: string? = if t0 then t0.doc else nil
+	if doc then
+		document_pages[web] = true
+	end
+	local opened_with: string? = doc or (if t0 then t0.url else nil)
 	-- What the field says: the page's address, or what's being typed.
-	local address = ui.use_state(if t0 and t0.url then t0.url else "")
+	local address = ui.use_state(opened_with or "")
 	-- The address the field last showed of the page's, so typing over it
 	-- is told from the page moving on.
 	local last_url: string = address:peek()
@@ -463,11 +503,50 @@ Page = ui.component(function(props: Props): Node
 	-- the page loads. (A reload finds the page where it was: nothing moves.)
 	-- A new tab with a home page set opens on it (once: the start page is
 	-- the way back to the project's previews when it's left).
-	if t0 and t0.url and not has_page(web) then
+	if t0 and t0.url and not doc and not has_page(web) then
 		local url = t0.url
 		ui.after(0, function()
 			web:load(url)
 		end)
+	end
+
+	-- A file's text, shown as it's asked for: at once, and again each time
+	-- (the file's globe pressed again, Reload). A page the host kept (the
+	-- scripts reloaded) stays as it was; one without a page yet is made.
+	local function show_document()
+		local d = documents:peek()[id]
+		if d then
+			shown_documents[id] = d.n
+			web:html(d.text)
+		end
+	end
+	if doc then
+		ui.effect(function()
+			local d = documents:get()[id]
+			if not d then
+				return
+			end
+			local blank = not has_page(web)
+			local seen = shown_documents[id]
+			if seen == d.n and not blank then
+				return
+			end
+			if seen == nil and not blank then
+				shown_documents[id] = d.n
+				return
+			end
+			show_document()
+		end)
+	end
+	-- Reload: a file's text made again from it (WebKit's reload of an
+	-- anchor's about:blank#… would be a blank page), else the page's own.
+	local function reload()
+		local u = web.url
+		if doc and type(u) == "string" and is_document(u) then
+			show_document()
+		else
+			web:reload()
+		end
 	end
 
 	-- What was typed and taken: the field keeps it until the page answers
@@ -539,21 +618,31 @@ Page = ui.component(function(props: Props): Node
 	local suggestions: any = nil
 
 	-- The page moving on: the field follows (unless something else is being
-	-- typed), the tab keeps the address.
+	-- typed), the tab keeps the address. A file's text says the file's path
+	-- (its anchors too), and is no visit: the tab is made again from the
+	-- text, not an address.
 	ui.effect(function()
 		local u = web.url
-		if type(u) ~= "string" or u == "" or u == "about:blank" then
+		if type(u) ~= "string" or u == "" then
 			return
 		end
+		local document = is_document(u)
+		if document and not doc then
+			return
+		end
+		local said = if document then doc :: string else u
 		local typed = address:peek()
 		if typed == last_url or typed == submitted or typed == "" then
 			if suggestions then
-				suggestions.quiet(u)
+				suggestions.quiet(said)
 			end
-			address:set(u)
+			address:set(said)
 		end
 		submitted = nil
-		last_url = u
+		last_url = said
+		if document then
+			return
+		end
 		state.set_url(key, id, u)
 		-- (On the address, not the load's end: a page's own moves, which
 		-- finish nothing, are visits too. The title follows as it comes.
@@ -618,7 +707,7 @@ Page = ui.component(function(props: Props): Node
 		end,
 		reload = function()
 			if has_page(web) then
-				web:reload()
+				reload()
 			end
 		end,
 		new_tab = function()
@@ -853,6 +942,10 @@ Page = ui.component(function(props: Props): Node
 				end },
 				{ label = ui.t("panel.browser.menu.copy_link"):get(), icon = "copy", disabled = no_page, on_select = function()
 					local u = web.url
+					-- (A file's text: the file's path, as the field says.)
+					if doc and type(u) == "string" and is_document(u) then
+						u = doc
+					end
 					if type(u) == "string" and u ~= "" then
 						ui.clipboard.write(u)
 					end
@@ -927,7 +1020,7 @@ Page = ui.component(function(props: Props): Node
 			rounded = "$radius.full",
 			inputmode = "url",
 			select_on_focus = true,
-			autofocus = not (t0 and t0.url) and not focused_once:peek()[id],
+			autofocus = not opened_with and not focused_once:peek()[id],
 			grow = 1,
 			role = "combobox",
 			expanded = suggestions.open,
@@ -1072,9 +1165,7 @@ Page = ui.component(function(props: Props): Node
 			disabled = function(): boolean
 				return not can_leave()
 			end,
-			on_click = function()
-				web:reload()
-			end,
+			on_click = reload,
 		}),
 		},
 		field_row,
@@ -1108,7 +1199,7 @@ Page = ui.component(function(props: Props): Node
 		more_menu,
 		},
 	}
-	if not (t0 and t0.url) and not focused_once:peek()[id] then
+	if not opened_with and not focused_once:peek()[id] then
 		focused_once:set_key(id, true)
 	end
 
