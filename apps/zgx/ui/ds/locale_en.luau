@@ -532,6 +532,7 @@ return {
 	["ds.mermaid.failed"] = "Couldn't draw this diagram: {reason}",
 	["ds.mermaid.view"] = "View diagram",
 	["ds.mermaid.name"] = "Mermaid diagram",
+	["ds.mermaid.full_screen"] = "Open full screen",
 	["ds.math.style.fira"] = "Sans",
 	["ds.math.style.stix"] = "Times-like",
 	["ds.math.style.computer_modern"] = "LaTeX's own",

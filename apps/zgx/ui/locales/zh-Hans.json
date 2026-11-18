@@ -683,7 +683,8 @@
       "show_diagram": "显示图表",
       "failed": "无法绘制此图表：{reason}",
       "view": "查看图表",
-      "name": "Mermaid 图表"
+      "name": "Mermaid 图表",
+      "full_screen": "全屏打开"
     },
     "math": {
       "style": {

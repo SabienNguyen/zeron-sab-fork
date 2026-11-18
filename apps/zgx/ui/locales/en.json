@@ -683,7 +683,8 @@
       "show_diagram": "Show diagram",
       "failed": "Couldn't draw this diagram: {reason}",
       "view": "View diagram",
-      "name": "Mermaid diagram"
+      "name": "Mermaid diagram",
+      "full_screen": "Open full screen"
     },
     "math": {
       "style": {

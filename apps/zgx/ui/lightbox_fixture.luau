@@ -19,6 +19,13 @@ local TINY: { Lightbox.Item } = { { src = "assets/favicons/zeron.png", name = "t
 -- A picture whose size was said wrong (a stale size kept for a path an agent
 -- has since written over: 868 by 617 said as 400 by 400).
 local STALE: { Lightbox.Item } = { { src = "assets/composer/shell.png", name = "stale.png", w = 400, h = 400 } }
+-- A tall diagram: its pixels (520 by 1800) and its vectors, drawn over
+-- them; zoomed past what can be drawn whole, its part on screen is drawn on
+-- its own.
+local DIAGRAM_SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="520" height="1800" viewBox="0 0 520 1800"><rect x="0" y="0" width="520" height="1800" fill="#ffffff"/><rect x="20" y="20" width="480" height="1760" rx="12" fill="#808080"/></svg>'
+local DIAGRAM: { Lightbox.Item } = { { src = "assets/lightbox/tall.png", name = "diagram.svg", svg = DIAGRAM_SVG } }
+-- The same with no size it says in numbers: never drawn in parts.
+local UNSIZED: { Lightbox.Item } = { { src = "assets/lightbox/tall.png", name = "unsized.svg", svg = '<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%"><rect width="520" height="1800" fill="#808080"/></svg>' } }
 
 local CARGO = ui.state("test_lightbox_cargo", {
 	{ id = "c1", kind = "image", name = "chip-shell.png", src = "assets/composer/shell.png" },
@@ -67,6 +74,8 @@ return ui.column {
 	ui.row { gap = "$space.2", table.unpack(thumbs) },
 	Lightbox.Thumb { group = "m2", index = 1, items = TINY, w = 40, h = 40, ui.image { src = TINY[1].src, w_full = true, h_full = true } },
 	Lightbox.Thumb { group = "m3", index = 1, items = STALE, w = 120, h = 84, ui.image { src = STALE[1].src, fit = "cover", w_full = true, h_full = true } },
+	Lightbox.Thumb { group = "m4", index = 1, items = DIAGRAM, w = 40, h = 84, ui.image { src = DIAGRAM[1].src, fit = "cover", w_full = true, h_full = true } },
+	Lightbox.Thumb { group = "m5", index = 1, items = UNSIZED, w = 40, h = 84, ui.image { src = UNSIZED[1].src, fit = "cover", w_full = true, h_full = true } },
 	cargo.Strip {
 		items = CARGO,
 		on_open = function(id: string)
