@@ -7,9 +7,9 @@
 -- code, with why under it.
 --
 -- Drawn, it sits in the code block's own frame: its own size, never wider
--- than the column (scaled down to it, never up), Show source / Show
--- diagram and Copy in the strip, and a click looks at it whole in the
--- lightbox, on the fence's fill.
+-- than the column (scaled down to it, never up), Open full screen, Show
+-- source / Show diagram and Copy in the strip, and a click (or Open full
+-- screen) looks at it whole in the lightbox, on the fence's fill.
 --
 --   Mermaid.Diagram { text = b.text, lang = b.lang, code = function() return CodeBlock { … } end,
 --     writing = function() return Mermaid.writing(source(), b.text) end }
@@ -243,7 +243,7 @@ M.Diagram = ui.component(function(props: Props): Node
 	end
 
 	-- The frame, as ds/markdown's code block's: its strip (the fence's tag,
-	-- the toggle, Copy) over the diagram or its source.
+	-- Open full screen, the toggle, Copy) over the diagram or its source.
 	local function frame(showing_source: boolean): Node
 		return ui.column {
 			class = `md-code lang-mermaid md-mermaid`,
@@ -269,6 +269,14 @@ M.Diagram = ui.component(function(props: Props): Node
 					color = "$text.tertiary",
 					grow = 1,
 					min_w = 0,
+				},
+				-- (A click on the diagram opens it too; this says so, and
+				-- opens it from its source as well.)
+				strip_button {
+					class = "mermaid-full-screen",
+					label = locale.t("ds.mermaid.full_screen"),
+					icon = "expand-arrows",
+					on_click = open,
 				},
 				strip_button {
 					class = "mermaid-toggle",

@@ -2,7 +2,8 @@
 -- .luau, a stand-in for the host's drawing): a fence still being written
 -- is its code and asks for nothing; once it closes it's drawn, a flowchart
 -- and a sequence diagram alike; Show source and Show diagram swap them in
--- the same frame; a click opens the diagram in the lightbox; one that
+-- the same frame; a click, or Open full screen in its strip, opens the
+-- diagram in the lightbox; one that
 -- can't be drawn stays code, with why under it.
 
 local function open_reply(): any
@@ -71,6 +72,32 @@ test("a diagram opens in the lightbox, on the fence's fill", function()
 	expect(open).never.to_be_nil()
 	expect(open.items[1].src).to_be("assets/composer/transcript.png")
 	expect(open.items[1].name).to_be("Mermaid diagram")
+	app:key("Escape")
+	app:frames(120)
+	expect(app:state("ds/lightbox.luau::open")).to_be_nil()
+	expect(app:error()).to_be_nil()
+end)
+
+test("Open full screen in the strip opens the diagram in the lightbox, from its source too", function()
+	local app = open_reply()
+	app:command("test.all")
+	expect(app:wait('role:button "View diagram"', { timeout_ms = 2000 })).to_be(true)
+	app:frames(20)
+	expect(app:count('role:button "Open full screen"')).to_be(2)
+	app:click('role:button "Open full screen"[1]')
+	app:frames(90)
+	local open = app:state("ds/lightbox.luau::open")
+	expect(open).never.to_be_nil()
+	expect(open.items[1].name).to_be("Mermaid diagram")
+	expect(open.items[1].svg).to_contain("<svg")
+	app:key("Escape")
+	app:frames(120)
+	expect(app:state("ds/lightbox.luau::open")).to_be_nil()
+	app:click('role:button "Show source"[1]')
+	app:frames(10)
+	app:click('role:button "Open full screen"[1]')
+	app:frames(90)
+	expect(app:state("ds/lightbox.luau::open")).never.to_be_nil()
 	app:key("Escape")
 	app:frames(120)
 	expect(app:state("ds/lightbox.luau::open")).to_be_nil()

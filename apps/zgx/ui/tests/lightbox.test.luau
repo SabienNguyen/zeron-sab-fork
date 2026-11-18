@@ -5,7 +5,8 @@
 -- its ends; zoom walks its steps, fits and goes to its own size; panning
 -- never brings the picture's edges inside the window; a click on the
 -- picture leaves it open and Close closes it; a small picture is never
--- enlarged to fit.
+-- enlarged to fit; a diagram zoomed past what can be drawn whole has the
+-- part on screen drawn on its own over it.
 
 local function open_box(): any
 	local app = mount("lightbox_fixture.luau")
@@ -254,4 +255,110 @@ test("zooming never leaves a frame without the picture: what the window showed i
 			expect(v.under.w > 0 and v.under.h > 0).to_be(true)
 		end
 	end
+end)
+
+-- A detail's view box, as numbers.
+local function view_box(d: any): { number }
+	local v = {}
+	for part in string.gmatch(d.view_box, "[^%s]+") do
+		table.insert(v, tonumber(part) :: number)
+	end
+	return v
+end
+
+-- The detail covers the picture's part of the window, on whole points, at
+-- the size it shows, and looks at that part of the document (520 by 1800,
+-- the picture's own size: one unit a pixel).
+local function expect_covers(v: any)
+	local d = v.detail
+	expect(d).never.to_be_nil()
+	local pw, ph = v.w * v.s, v.h * v.s
+	local px0, py0 = v.cx - pw / 2, v.cy - ph / 2
+	expect(d.x).to_be(math.round(d.x))
+	expect(d.y).to_be(math.round(d.y))
+	expect(d.x <= math.max(0, px0) + 0.5).to_be(true)
+	expect(d.y <= math.max(0, py0) + 0.5).to_be(true)
+	expect(d.x + d.w >= math.min(v.win_w, px0 + pw) - 0.5).to_be(true)
+	expect(d.y + d.h >= math.min(v.win_h, py0 + ph) - 0.5).to_be(true)
+	expect(near(d.laid_w, d.w) and near(d.laid_h, d.h)).to_be(true)
+	local b = view_box(d)
+	expect(math.abs(b[1] - (d.x - px0) / v.s) < 0.01).to_be(true)
+	expect(math.abs(b[2] - (d.y - py0) / v.s) < 0.01).to_be(true)
+	expect(math.abs(b[3] - d.w / v.s) < 0.01).to_be(true)
+	expect(math.abs(b[4] - d.h / v.s) < 0.01).to_be(true)
+	-- Only about the window, not the whole diagram.
+	expect(d.w * d.h < pw * ph).to_be(true)
+	expect(d.code).to_contain(`viewBox="{d.view_box}"`)
+	expect(d.code).never.to_contain('viewBox="0 0 520 1800"')
+	expect(d.code).to_contain('rx="12"')
+end
+
+test("a diagram zoomed past what can be drawn whole draws the part on screen on its own, sharp, and lets it go zoomed out", function()
+	local app = open_box()
+	app:click('"Open diagram.svg"')
+	app:frames(90)
+	expect(view(app).detail).to_be_nil()
+	-- Its own size (520 by 1800, 3.7M pixels at 2x) is drawn whole.
+	app:key("cmd+1")
+	app:frames(60)
+	expect(view(app).detail).to_be_nil()
+	-- 150%: 8.4M pixels, past it.
+	app:key("cmd+=")
+	app:key("cmd+=")
+	app:frames(60)
+	local v = view(app)
+	expect(near(v.s, 1.5)).to_be(true)
+	expect_covers(v)
+	-- A short pan stays inside its margin: the same drawing, moved.
+	local code = v.detail.code
+	app:scroll('"Image viewer"', 60)
+	app:frames(30)
+	v = view(app)
+	expect(v.detail.code).to_be(code)
+	expect_covers(v)
+	-- A long one goes past it: drawn again where the window is now.
+	app:scroll('"Image viewer"', 1200)
+	app:frames(30)
+	v = view(app)
+	expect(v.detail.code).never.to_be(code)
+	expect_covers(v)
+	-- Further in, and it follows the zoom.
+	code = v.detail.code
+	app:key("cmd+=")
+	app:frames(60)
+	v = view(app)
+	expect(near(v.s, 2)).to_be(true)
+	expect(v.detail.code).never.to_be(code)
+	expect_covers(v)
+	-- Fitted, the whole is enough again.
+	app:key("cmd+0")
+	app:frames(60)
+	expect(view(app).fitted).to_be(true)
+	expect(view(app).detail).to_be_nil()
+	expect(app:error()).to_be_nil()
+end)
+
+test("a picture with no vectors, or vectors with no size to map, is never drawn in parts", function()
+	local app = open_box()
+	app:click('"Open night.jpg"')
+	app:frames(90)
+	app:key("cmd+1")
+	app:key("cmd+=")
+	app:key("cmd+=")
+	app:key("cmd+=")
+	app:frames(60)
+	expect(view(app).s >= 2).to_be(true)
+	expect(view(app).detail).to_be_nil()
+	app:key("Escape")
+	app:frames(120)
+	app:click('"Open unsized.svg"')
+	app:frames(90)
+	app:key("cmd+1")
+	app:key("cmd+=")
+	app:key("cmd+=")
+	app:key("cmd+=")
+	app:frames(60)
+	expect(view(app).s >= 2).to_be(true)
+	expect(view(app).detail).to_be_nil()
+	expect(app:error()).to_be_nil()
 end)

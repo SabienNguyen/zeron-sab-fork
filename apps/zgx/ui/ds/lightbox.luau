@@ -34,7 +34,8 @@
 -- the file on this Mac (Copy path, Reveal), `w`/`h` its size in pixels if
 -- known; `svg`, a vector picture's document (a diagram's), drawn over `src`
 -- (its pixels, which give its size and stand in) at the size it shows, so
--- it stays sharp as it zooms in.
+-- it stays sharp as it zooms in; zoomed past what can be drawn whole, the
+-- part on screen is drawn on its own over it.
 
 local Icon = require("@self/icon")
 local IconButton = require("@self/icon_button").IconButton
@@ -88,6 +89,13 @@ local SETTLE = 140
 -- A vector picture's raster at most, in pixels at 2x (zgx draws an SVG
 -- up to 32 MiB: 8.4 million pixels).
 local SVG_PIXELS = 8000000
+-- Zoomed past that, the part on screen is drawn on its own over the whole
+-- (`refine` in the stage), the two within SVG_PIXELS: the whole held to
+-- DETAIL_BASE, the part to the rest, with as much of a quarter of the view
+-- around it as has room.
+local DETAIL_BASE = 1500000
+local DETAIL_PIXELS = SVG_PIXELS - DETAIL_BASE
+local DETAIL_MARGINS = { 0.25, 0.1, 0 }
 -- The controls go this long after the pointer rests.
 local IDLE = 1600
 
@@ -140,6 +148,57 @@ end
 
 local function lerp(a: number, b: number, t: number): number
 	return a + (b - a) * t
+end
+
+-- A vector picture's own box: its root's viewBox, else its width and
+-- height (plain numbers or px), and where its root tag is. Nil where it
+-- says neither, or in units this can't map (%, em): no part of it is then
+-- drawn on its own.
+type SvgBox = { x: number, y: number, w: number, h: number, open: number, close: number }
+local function svg_box(doc: string): SvgBox?
+	local open = string.find(doc, "<svg[%s>/]")
+	local close = if open then string.find(doc, ">", open, true) else nil
+	if not open or not close then
+		return nil
+	end
+	local tag = string.sub(doc, open, close)
+	local function attr(name: string): string?
+		return string.match(tag, `%s{name}%s*=%s*"([^"]*)"`) or string.match(tag, `%s{name}%s*=%s*'([^']*)'`)
+	end
+	local vb = attr("viewBox")
+	if vb then
+		local v = {}
+		for part in string.gmatch(vb, "[^%s,]+") do
+			table.insert(v, tonumber(part) or 0 / 0)
+		end
+		if #v == 4 and v[3] > 0 and v[4] > 0 and v[1] == v[1] and v[2] == v[2] then
+			return { x = v[1], y = v[2], w = v[3], h = v[4], open = open, close = close }
+		end
+		return nil
+	end
+	local function length(name: string): number?
+		local v = attr(name)
+		if not v then
+			return nil
+		end
+		return tonumber(v) or tonumber(string.match(v, "^%s*(.-)%s*px%s*$") or "")
+	end
+	local w, h = length("width"), length("height")
+	if w and h and w > 0 and h > 0 then
+		return { x = 0, y = 0, w = w, h = h, open = open, close = close }
+	end
+	return nil
+end
+
+-- `doc` looking only at `view_box` (in its own units), drawn `w` by `h`:
+-- its root's box rewritten, the rest as it is.
+local function svg_part(doc: string, box: SvgBox, view_box: string, w: number, h: number): string
+	local tag = string.sub(doc, box.open + 4, box.close)
+	for _, name in { "viewBox", "width", "height", "preserveAspectRatio" } do
+		tag = (string.gsub(tag, `%s{name}%s*=%s*"[^"]*"`, ""))
+		tag = (string.gsub(tag, `%s{name}%s*=%s*'[^']*'`, ""))
+	end
+	return `{string.sub(doc, 1, box.open - 1)}<svg width="{w}" height="{h}" viewBox="{view_box}" preserveAspectRatio="none"{tag}{string.sub(doc, box.close + 1)}`
 end
 
 -- A picture of an element as the window last showed it (`el:snapshot`): a
@@ -284,8 +343,22 @@ local StageView = ui.component(function(st: Stage): Node
 	-- window; plain (moved per gesture), `tick` redraws.
 	local view = { s = 1, cx = 0, cy = 0, fitted = true }
 	local tick = ui.use_state(0)
+	-- (The detail's derivation, `refine`, set below once the view's helpers
+	-- are: run once the view has rested, as a pan or a zoom settles.)
+	local refine: () -> () = function() end
+	local refine_gen = 0
+	local function refine_later()
+		refine_gen += 1
+		local gen = refine_gen
+		ui.after(SETTLE, function()
+			if gen == refine_gen then
+				refine()
+			end
+		end)
+	end
 	local function redraw()
 		tick:set(tick:peek() + 1)
+		refine_later()
 	end
 	-- The size the picture is laid out at (its scale at the last rest).
 	local laid = ui.use_state(1)
@@ -341,6 +414,11 @@ local StageView = ui.component(function(st: Stage): Node
 			if gen == settle_gen and laid:peek() ~= view.s then
 				laid:set(view.s)
 				rested_at = ui.now()
+			end
+			-- (With it, in the same frame: the whole, laid out smaller under
+			-- a detail, is never drawn without one.)
+			if gen == settle_gen then
+				refine()
 			end
 		end)
 	end
@@ -526,6 +604,124 @@ local StageView = ui.component(function(st: Stage): Node
 		end
 	end
 
+	-- A vector picture zoomed past SVG_PIXELS can't be drawn whole at the
+	-- size it shows: the part on screen, with a margin of it around (so a
+	-- short pan stays sharp), is drawn on its own over it, from a copy of
+	-- its document looking only at that part (its root's viewBox, width and
+	-- height rewritten), at the size it shows, its edges on whole points so
+	-- its raster lands on the display's pixels one to one. The whole under
+	-- it is held to DETAIL_BASE. Derived again once the view rests, only
+	-- where the one drawn no longer covers the window at this zoom; while a
+	-- gesture runs it is moved and scaled with the picture. One at a time:
+	-- a new one replaces the last in the frame it is drawn (zgx draws an
+	-- SVG as it is shown, never decoding behind), so it never blanks.
+	-- (`bx`…: its box in the window as it was derived, at the view `s0`,
+	-- `cx0`, `cy0`; `q`: how much of that size it is laid out at, under 1
+	-- only where even the window alone passes DETAIL_PIXELS.)
+	type Detail = { item: string, code: string, view_box: string, s0: number, cx0: number, cy0: number, bx: number, by: number, bw: number, bh: number, q: number }
+	local detail = ui.use_state(false :: any) :: State<Detail | false>
+	-- Vector pictures' own boxes, by document.
+	local boxes: { [string]: SvgBox | false } = {}
+	-- Where the detail lands now (its corner) and its scale since it was
+	-- derived: on whole points while that is 1 (a pan moves it fractions).
+	local function placed(d: Detail): (number, number, number)
+		local r = view.s / d.s0
+		local x = view.cx + (d.bx - d.cx0) * r
+		local y = view.cy + (d.by - d.cy0) * r
+		if math.abs(r - 1) < 0.001 then
+			return math.round(x), math.round(y), 1
+		end
+		return x, y, r
+	end
+	refine = function()
+		local was = detail:peek()
+		local function drop()
+			if was then
+				detail:set(false)
+			end
+		end
+		local it = item()
+		local nat = natural()
+		if not it or not it.svg or not nat or st.morphing:peek() or st.leaving:peek() then
+			drop()
+			return
+		end
+		-- (Still moving: it settles, and asks again.)
+		if motion then
+			return
+		end
+		local pw, ph = nat.w * view.s, nat.h * view.s
+		if pw * ph * 4 <= SVG_PIXELS then
+			drop()
+			return
+		end
+		local doc = it.svg :: string
+		local box = boxes[doc]
+		if box == nil then
+			box = svg_box(doc) or false
+			boxes[doc] = box
+		end
+		if not box then
+			drop()
+			return
+		end
+		local size = window_size(false)
+		local px0, py0 = view.cx - pw / 2, view.cy - ph / 2
+		-- The picture's part of the window.
+		local vx0, vy0 = math.max(0, px0), math.max(0, py0)
+		local vx1, vy1 = math.min(size.width, px0 + pw), math.min(size.height, py0 + ph)
+		if vx1 <= vx0 or vy1 <= vy0 then
+			drop()
+			return
+		end
+		-- The one drawn still covers it, at this zoom: kept.
+		if was and was.item == it.src and math.abs(view.s / was.s0 - 1) < 0.001 then
+			local x, y = placed(was)
+			if x <= vx0 + 0.5 and y <= vy0 + 0.5 and x + was.bw >= vx1 - 0.5 and y + was.bh >= vy1 - 0.5 then
+				return
+			end
+		end
+		-- Its box: as much margin as DETAIL_PIXELS has room for, out to
+		-- whole points, inside the picture.
+		local vw, vh = vx1 - vx0, vy1 - vy0
+		local bx, by, bw, bh = 0, 0, 1, 1
+		for _, margin in DETAIL_MARGINS do
+			bx = math.floor(math.max(vx0 - vw * margin, px0))
+			by = math.floor(math.max(vy0 - vh * margin, py0))
+			bw = math.ceil(math.min(vx1 + vw * margin, px0 + pw)) - bx
+			bh = math.ceil(math.min(vy1 + vh * margin, py0 + ph)) - by
+			if bw * bh * 4 <= DETAIL_PIXELS then
+				break
+			end
+		end
+		local q = math.min(1, math.sqrt(DETAIL_PIXELS / (bw * bh * 4)))
+		-- That box in the document's own units, as the whole is drawn:
+		-- scaled evenly into the picture's box and centred (SVG's default).
+		local b = box :: SvgBox
+		local u = math.min(pw / b.w, ph / b.h)
+		local ox, oy = px0 + (pw - b.w * u) / 2, py0 + (ph - b.h * u) / 2
+		local view_box = string.format("%.4f %.4f %.4f %.4f", b.x + (bx - ox) / u, b.y + (by - oy) / u, bw / u, bh / u)
+		detail:set({
+			item = it.src,
+			code = "code:" .. svg_part(doc, b, view_box, bw, bh),
+			view_box = view_box,
+			s0 = view.s,
+			cx0 = view.cx,
+			cy0 = view.cy,
+			bx = bx,
+			by = by,
+			bw = bw,
+			bh = bh,
+			q = q,
+		})
+	end
+
+	-- (The window resized shows more of it, or less: derived again.)
+	ui.effect(function()
+		window_size(true)
+		refine_later()
+	end)
+
 	-- Measured (or known): fitted, laid out at that, then the host starts
 	-- its motion. A reload finds it measured and at rest.
 	local ready = false
@@ -542,6 +738,7 @@ local StageView = ui.component(function(st: Stage): Node
 	-- Another picture of the set: fitted, fading in where it is.
 	local function on_swap()
 		standin:set(false)
+		detail:set(false)
 		stop_motion()
 		fit()
 		laid:set(view.s)
@@ -574,7 +771,13 @@ local StageView = ui.component(function(st: Stage): Node
 				pic_y = view.cy - nat.h * view.s / 2,
 			}
 		end
-		return { under = under, s = view.s, cx = view.cx, cy = view.cy, fitted = view.fitted, laid = laid:peek(), w = nat and nat.w, h = nat and nat.h, win_w = size.width, win_h = size.height, fit = fit_scale(), morphing = st.morphing:peek(), alpha = st.alpha:peek(), lift = st.lift:peek() }
+		local d = detail:peek()
+		local sharp = nil
+		if d then
+			local x, y, r = placed(d)
+			sharp = { x = x, y = y, w = d.bw * r, h = d.bh * r, laid_w = d.bw * d.q, laid_h = d.bh * d.q, view_box = d.view_box, code = d.code }
+		end
+		return { under = under, detail = sharp, s = view.s, cx = view.cx, cy = view.cy, fitted = view.fitted, laid = laid:peek(), w = nat and nat.w, h = nat and nat.h, win_w = size.width, win_h = size.height, fit = fit_scale(), morphing = st.morphing:peek(), alpha = st.alpha:peek(), lift = st.lift:peek() }
 	end
 	-- Its file gone (a sent picture deleted) or not a picture: nothing to
 	-- draw, and it says so in the picture's place (`ui.image`'s `on_error`).
@@ -685,10 +888,12 @@ local StageView = ui.component(function(st: Stage): Node
 		}
 	end
 	-- How much of its laid-out size a vector picture is drawn at: all of
-	-- it, or less where that would pass SVG_PIXELS at 2x (the rest a scale).
+	-- it, or less where that would pass SVG_PIXELS at 2x (the rest a scale),
+	-- or DETAIL_BASE under a detail.
 	local function svg_cap(g: Geo): number
 		local px = g.lw * g.lh * 4
-		return if px > SVG_PIXELS then math.sqrt(SVG_PIXELS / px) else 1
+		local most = if detail:get() then DETAIL_BASE else SVG_PIXELS
+		return if px > most then math.sqrt(most / px) else 1
 	end
 	-- Square pixels from its own size up, where they land on whole device
 	-- pixels (2x and on) or are large enough to read as pixels (3x and on).
@@ -1299,7 +1504,7 @@ local StageView = ui.component(function(st: Stage): Node
 			-- A vector picture (`svg`): over its pixels, laid out at the
 			-- size it shows once at rest, so zooming in keeps it sharp. Its
 			-- raster is held to SVG_PIXELS (zgx draws no larger an SVG),
-			-- scaled up past that.
+			-- scaled up past that (and to DETAIL_BASE under a detail).
 			ui.svg {
 				src = function(): string
 					local it = item()
@@ -1331,6 +1536,64 @@ local StageView = ui.component(function(st: Stage): Node
 					return g.k / svg_cap(g)
 				end,
 			},
+			-- Over it, zoomed past SVG_PIXELS: the part on screen drawn on
+			-- its own (`refine`), moved and scaled with the picture until
+			-- it is derived again. (Not while it grows or goes.)
+			ui.show(
+				function(): boolean
+					local d = detail:get()
+					local it = item()
+					return type(d) == "table" and it ~= nil and d.item == it.src and not st.morphing:get() and not st.leaving:get()
+				end,
+				ui.svg {
+					class = "lightbox-detail",
+					src = function(): string
+						local d = detail:get()
+						return if d then d.code else ""
+					end,
+					aria_hidden = true,
+					pointer_events = "none",
+					absolute = true,
+					left = 0,
+					top = 0,
+					w = function(): number
+						local d = detail:get()
+						return if d then math.max(1, d.bw * d.q) else 1
+					end,
+					h = function(): number
+						local d = detail:get()
+						return if d then math.max(1, d.bh * d.q) else 1
+					end,
+					-- (Scaled about its middle: its corner put where it lands.)
+					x = function(): number
+						tick:get()
+						local d = detail:get()
+						if not d then
+							return 0
+						end
+						local x, _, r = placed(d)
+						return x + d.bw * (r - d.q) / 2 - geo().cx
+					end,
+					y = function(): number
+						tick:get()
+						local d = detail:get()
+						if not d then
+							return 0
+						end
+						local _, y, r = placed(d)
+						return y + d.bh * (r - d.q) / 2 - geo().cy
+					end,
+					scale = function(): number
+						tick:get()
+						local d = detail:get()
+						if not d then
+							return 1
+						end
+						local _, _, r = placed(d)
+						return r / d.q
+					end,
+				}
+			),
 		},
 		-- Its file gone: a note in the picture's place.
 		ui.show(
