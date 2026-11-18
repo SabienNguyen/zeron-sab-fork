@@ -280,6 +280,8 @@ pub fn tool_fields(part: &Json) -> Vec<(&'static str, Value)> {
     }
     if let Some(pictures) = pictures_value(part) {
         fields.push(("pictures", pictures));
+    } else if let Some(named) = named_picture(part) {
+        fields.push(("named_picture", named));
     }
     fields
 }
@@ -322,6 +324,31 @@ fn pictures_in(part: &Json, data_dir: Option<&std::path::Path>) -> Option<Value>
         })
         .collect();
     Some(Value::List(list.into()))
+}
+
+/// The picture a Read or a Write named (`call.path`, a PNG, JPEG, WebP or
+/// GIF by its name), for a row whose result kept no copy of it (an older
+/// doc, a Write): `{ path, name }`. Never read from here, not even looked
+/// at: the row asks for it only when it is inside the chat's folder
+/// (screens/chat/reply_images `for_folder`), and the chat's engine reads it
+/// from strictly inside that folder (`files.chat_image`), as a reply's
+/// pictures are. A path that isn't a whole one on its device (`~`, a URL, a
+/// network path, a relative one) is none.
+fn named_picture(part: &Json) -> Option<Value> {
+    let call = &part["call"];
+    if !matches!(call["kind"].as_str(), Some("readFile" | "writeFile")) {
+        return None;
+    }
+    let path = call["path"].as_str()?;
+    let b = path.as_bytes();
+    let whole = (b.first() == Some(&b'/') && b.get(1) != Some(&b'/'))
+        || (b.len() > 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/'));
+    let name = file_name(path)?;
+    let ext = name.rsplit_once('.')?.1.to_ascii_lowercase();
+    if !whole || !["png", "jpg", "jpeg", "webp", "gif"].contains(&ext.as_str()) {
+        return None;
+    }
+    Some(Value::record([("path", Value::from(path)), ("name", Value::from(name))]))
 }
 
 /// Whether `path` is a copy the engine stored of a tool result's picture:
@@ -396,9 +423,45 @@ mod tests {
         let Some(Value::List(list)) = pictures_in(&several, None) else { panic!("no pictures") };
         let names: Vec<_> = list.iter().map(|p| p.field("name").map(crate::auth::text).unwrap_or_default()).collect();
         assert!(names.iter().all(|n| n.starts_with("tool-") && n.ends_with("-image.png")), "{names:?}");
-        // None stored (an older doc, a path only named): no pictures.
+        // None stored (an older doc, a path only named): no pictures; the
+        // path it named is only offered (`named_picture`), never read here.
         let bare = json!({ "kind": "tool", "id": "t2", "call": { "kind": "readFile", "path": "/x/a.png" } });
-        assert!(!tool_fields(&bare).iter().any(|(k, _)| *k == "pictures"));
+        let fields = tool_fields(&bare);
+        assert!(!fields.iter().any(|(k, _)| *k == "pictures"));
+        assert!(fields.iter().any(|(k, _)| *k == "named_picture"));
+    }
+
+    /// A path a Read or a Write only named is offered to its row, never read
+    /// here: only an image by its name, a whole path on its device. Whether
+    /// it is inside the chat's folder is the row's to ask (an outside one is
+    /// refused there: screens/chat/reply_images `for_folder`), and the
+    /// engine reads it only from strictly inside that folder. A stored copy
+    /// wins over it.
+    #[test]
+    fn a_named_picture_is_only_offered_never_read() {
+        let named = |kind: &str, path: &str| {
+            let part = json!({ "kind": "tool", "id": "t", "call": { "kind": kind, "path": path } });
+            named_picture(&part).map(|v| v.field("path").map(crate::auth::text).unwrap_or_default())
+        };
+        for path in ["/repo/shots/a.png", "/repo/a.JPG", "/repo/b.jpeg", "/repo/c.webp", "/repo/d.gif", r"C:\repo\e.png", "C:/repo/f.png"] {
+            assert_eq!(named("readFile", path).as_deref(), Some(path), "{path}");
+        }
+        assert_eq!(named("writeFile", "/repo/out.png").as_deref(), Some("/repo/out.png"));
+        // Not a picture, not a whole path on its device.
+        for path in ["/repo/a.rs", "/repo/png", "~/a.png", "shots/a.png", "//host/share/a.png", r"\\host\a.png", "file:///a.png", "https://x/a.png", "/dev/zero", ""] {
+            assert_eq!(named("readFile", path), None, "{path}");
+        }
+        // Only a Read's or a Write's.
+        assert_eq!(named("editFile", "/repo/a.png"), None);
+        assert_eq!(named("exec", "/repo/a.png"), None);
+        // A stored copy is the row's picture; the named path isn't offered.
+        let both = json!({
+            "kind": "tool", "id": "t", "call": { "kind": "readFile", "path": "/repo/a.png" },
+            "previewPaths": [STORED],
+        });
+        let fields = tool_fields(&both);
+        assert!(fields.iter().any(|(k, _)| *k == "pictures"));
+        assert!(!fields.iter().any(|(k, _)| *k == "named_picture"));
     }
 
     /// Only the engine's own copies are a row's pictures: a doc naming a

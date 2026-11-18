@@ -222,6 +222,53 @@ function M.for_session(session: () -> Session?, read: Read?): Pictures
 	end, false)
 end
 
+-- Whether `path` (a whole path) is inside the folder `cwd`, by its words:
+-- under it past a separator, with no `.` or `..` step anywhere. (A link
+-- inside that leads out is the engine's to refuse: it reads none.)
+function M.inside(path: string, cwd: string?): boolean
+	if not cwd or not M.whole(cwd) or not M.whole(path) then
+		return false
+	end
+	local function steps(p: string): { string }
+		local out = {}
+		for step in string.gmatch(p, "[^\\/]+") do
+			table.insert(out, step)
+		end
+		return out
+	end
+	local own, under = steps(path), steps(cwd)
+	-- (A Windows path's drive and steps match whatever their case.)
+	local fold = string.sub(cwd, 1, 1) ~= "/"
+	if fold ~= (string.sub(path, 1, 1) ~= "/") or #own <= #under then
+		return false
+	end
+	for _, step in own do
+		if step == "." or step == ".." then
+			return false
+		end
+	end
+	for i, step in under do
+		local mine = own[i]
+		if if fold then string.lower(mine) ~= string.lower(step) else mine ~= step then
+			return false
+		end
+	end
+	return true
+end
+
+-- The pictures an agent's steps name (a thought's `![](path)`, the file a
+-- Read or a Write named) in the chat `session()` says is open: as a
+-- reply's are resolved and read (`files.chat_image`, the engine reading
+-- strictly inside the chat's folder, even on this device), and only one
+-- inside the chat's folder at all (`inside`): a step never asks for a
+-- picture anywhere else on its device.
+function M.for_folder(session: () -> Session?, read: Read?): Pictures
+	return provider(session, read or M.read, function(src: string, s: Session): string?
+		local path = M.path(src, s.cwd)
+		return if path and M.inside(path, s.cwd) then path else nil
+	end, false)
+end
+
 -- How a sent picture is read from the chat's device: the host's action.
 M.read_attachment = function(target: { chat: string, device: string? }, path: string): any
 	return ui.call("files.attachment", { target = target, path = path })
